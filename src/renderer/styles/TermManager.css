@@ -1,0 +1,105 @@
+.term-manager {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.term-manager .header {
+  background-color: #fff;
+  padding: 16px 24px;
+  border-bottom: 1px solid #f0f0f0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  flex-shrink: 0;
+}
+
+.term-manager .header h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: #000;
+}
+
+.term-manager .content {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.term-manager .sidebar {
+  background-color: #fafafa;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.domains-section {
+  padding: 16px;
+}
+
+.domains-section h3 {
+  margin: 0 0 12px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #333;
+}
+
+.add-domain-btn {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.term-manager .main-content {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex: 1;
+}
+
+.toolbar {
+  padding: 8px 16px;
+  background-color: #fff;
+  border-bottom: 1px solid #f0f0f0;
+  display: grid;
+  grid-template-columns: 200px auto 1fr;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+  max-height: 160px;
+  overflow-y: auto;
+  row-gap: 8px;
+}
+
+.terms-table-wrapper {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px 16px 16px;
+}
+
+.terms-table {
+  flex: 1;
+  overflow: auto;
+  background-color: #fff;
+  border: 1px solid #f0f0f0;
+  border-radius: 4px;
+}
+
+.terms-table :global(.ant-table) {
+  font-size: 13px;
+  margin-bottom: 0;
+}
+
+.terms-table :global(.ant-table-cell) {
+  padding: 8px 12px;
+  word-break: break-word;
+}
+
+.terms-table :global(.ant-table-thead > tr > th) {
+  background-color: #fafafa;
+  font-weight: 600;
+  padding: 10px 12px;
+}
+
+.terms-table :global(.ant-table-body) {
+  font-size: 13px;
+}

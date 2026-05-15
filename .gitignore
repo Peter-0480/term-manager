@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+out/
+
+# Database files (user data, should not be in repo)
+*.db
+*.sqlite
+
+# User data and settings (should not be in repo)
+term-manager-data.json
+term-manager-settings.json
+
+# Backup files
+*.backup-*.json
+*.backup-*.ts
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temporary files
+temp.txt
+test.txt
+test-file.txt
+build_log.txt
+build_output.txt
+console.log*
+
+# Debug dump files
+zz_*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+.env.*.local
