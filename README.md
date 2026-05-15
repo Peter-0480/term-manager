@@ -68,7 +68,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/term-manager.git
+git clone https://github.com/Peter-0480/term-manager.git
 cd term-manager
 
 # 安装依赖
