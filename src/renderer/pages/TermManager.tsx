@@ -22,6 +22,7 @@ import {
 } from 'antd';
 import { PlusOutlined, DeleteOutlined, EditOutlined, ReloadOutlined, EyeOutlined, MoreOutlined, ExportOutlined, SettingOutlined, SearchOutlined, LockOutlined, UnlockOutlined, RobotOutlined, StarOutlined } from '@ant-design/icons';
 import { ipcApi } from '../ipc-api';
+import logo from '../assets/logo.png';
 import TermDetail from '../components/TermDetail';
 import TranslationEditor from '../components/TranslationEditor';
 import type { TranslationEntry } from '../components/TranslationEditor';
@@ -2509,7 +2510,10 @@ export default function TermManager() {
         alignItems: 'center',
         justifyContent: 'space-between'
       }}>
-        <h2 style={{ color: '#fff', margin: 0 }}>术语管理</h2>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <img src={logo} alt="青鸟" style={{ width: 28, height: 28, objectFit: 'contain' }} />
+          <h2 style={{ color: '#fff', margin: 0, fontSize: 18 }}>青鸟智能术语管理系统</h2>
+        </div>
         
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
           {/* 搜索框 */}
