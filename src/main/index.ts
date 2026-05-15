@@ -11,9 +11,11 @@ let mainWindow: BrowserWindow | null = null;
 
 function createWindow() {
   console.log('MAIN: Creating main window...');
-  mainWindow = new BrowserWindow({
+    mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
+    title: '青鸟智能术语管理系统',
+    icon: path.join(__dirname, '../../build/青鸟.ico'),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,

@@ -44,12 +44,13 @@
     "vite": "^5.0.0"
   },
   "build": {
-    "appId": "com.termmanager.app",
+    "appId": "com.bluebird.term-manager",
     "files": [
       "dist/**/*",
       "!dist/main/database.db"
     ],
     "win": {
+      "icon": "build/青鸟.ico",
       "target": [
         "nsis",
         "portable"
@@ -57,7 +58,9 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/青鸟.ico",
+      "uninstallerIcon": "build/青鸟.ico"
     }
   },
   "optionalDependencies": {
