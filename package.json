@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/term-manager.git"
+    "url": "https://github.com/Peter-0480/term-manager.git"
   },
   "main": "./out/main/index.cjs",
   "type": "module",
