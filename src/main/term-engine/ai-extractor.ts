@@ -150,6 +150,49 @@ function chunkTextForAI(text: string, chunkSize: number = 6000, language: string
 }
 
 // ═══════════════════════════════════════════
+// [新增] JSON字段名 / 噪声数据过滤
+// ═══════════════════════════════════════════
+
+/**
+ * JSON Schema 保留字段名黑名单
+ * AI 可能误将这些字段名当作术语输出，必须过滤
+ */
+const JSON_FIELD_NAME_BLACKLIST = new Set([
+  'term_text',
+  'source_lang',
+  'target_term',
+  'target_lang',
+  'score',
+  'translation_confidence',
+  'translation_source',
+  'abbreviation_suggestion',
+  'abbreviation',
+  'source_confidence',
+  'source_term',
+  'output',
+]);
+
+/**
+ * 检测 term_text 是否为 JSON 字段名或代码标识符噪声
+ */
+export function isNoiseTerm(text: string): boolean {
+  if (!text || text.length < 2) return true;
+
+  const normalized = text
+    .replace(/^["'`]+|["'`]+$/g, '')  // 去掉外层引号
+    .trim()
+    .toLowerCase();
+
+  // 1. 黑名单精确匹配（仅过滤明确是JSON字段名的文本）
+  if (JSON_FIELD_NAME_BLACKLIST.has(normalized)) return true;
+
+  // 2. 纯标点/纯数字/纯空白
+  if (/^[\s\d\p{P}]+$/u.test(text)) return true;
+
+  return false;
+}
+
+// ═══════════════════════════════════════════
 // [方案B] 概念首倡语言后处理
 // ═══════════════════════════════════════════
 
@@ -159,6 +202,11 @@ function chunkTextForAI(text: string, chunkSize: number = 6000, language: string
  * 而 "依法治国" 的首倡语言是中文
  */
 function postCheckSourceLanguage(term: ExtractedTerm): ExtractedTerm {
+  // 仅当AI未返回source_lang或返回无效值时，用规则补全
+  if (term.source_lang && term.source_lang !== '' && term.source_lang !== 'null') {
+    return term; // AI已判断，不覆盖
+  }
+
   // 如果术语主要是英文字母/缩写，判定为英文源
   if (/^[A-Za-z0-9\s\-\+\/]+$/.test(term.term_text) && term.term_text.length > 1) {
     const alphaOnly = term.term_text.replace(/[^a-zA-Z]/g, '');
@@ -180,22 +228,19 @@ function postCheckSourceLanguage(term: ExtractedTerm): ExtractedTerm {
 // ═══════════════════════════════════════════
 
 function calculateTranslationValueV2(term: ExtractedTerm, _language: string): number {
-  let value = 0;
+  let value = 4;  // 基准分从0提升到4，保证所有术语获得基础价值
 
   // 有译文的加分
   if (term.target_term && term.target_term.length > 0) {
-    value += 3;
+    value += 2;
   }
 
-  // 长术语（可能需要专业知识才能翻译）加分
-  if (term.term_text.length >= 5) value += 2;
-  if (term.term_text.length >= 10) value += 1;
+  // 长度加分（≥4字 +1, ≥8字 +1）
+  if (term.term_text.length >= 4) value += 1;
+  if (term.term_text.length >= 8) value += 1;
 
-  // 包含专有名词特征（大写字母开头）
-  if (/[A-Z]/.test(term.term_text)) value += 2;
-
-  // 基础分 + 置信度影响
-  value += Math.min(4, term.score / 2.5);
+  // AI 评分影响（压缩到合理的贡献范围）
+  value += Math.min(3, term.score / 3.3);
 
   return Math.min(10, value);
 }
@@ -232,7 +277,7 @@ function smartDeduplicateTerms(terms: ExtractedTerm[]): ExtractedTerm[] {
 }
 
 // ═══════════════════════════════════════════
-// Prompt 构建
+// Prompt 构建 (v4: AI自主模式完全重写 —— 自然语言描述输出结构，消除字段名泄漏)
 // ═══════════════════════════════════════════
 
 function buildSystemInstruction(
@@ -249,14 +294,111 @@ function buildSystemInstruction(
     ? `\n检测到多语言：${detectedLangs}`
     : '';
 
-  return `你是一位术语抽取专家，为中文母语译者服务。
+  const foreignLangHint = detectedLangs
+    ? (() => {
+        const frMatch = detectedLangs.match(/fr/i);
+        const deMatch = detectedLangs.match(/de/i);
+        const esMatch = detectedLangs.match(/es/i);
+        const itMatch = detectedLangs.match(/it/i);
+        const ptMatch = detectedLangs.match(/pt/i);
+        const jaMatch = detectedLangs.match(/ja/i);
+        const koMatch = detectedLangs.match(/ko/i);
+        const ruMatch = detectedLangs.match(/ru/i);
+        const arMatch = detectedLangs.match(/ar/i);
+        const enMatch = detectedLangs.match(/en/i);
+        if (frMatch) return 'fr（法语）';
+        if (deMatch) return 'de（德语）';
+        if (esMatch) return 'es（西班牙语）';
+        if (itMatch) return 'it（意大利语）';
+        if (ptMatch) return 'pt（葡萄牙语）';
+        if (jaMatch) return 'ja（日语）';
+        if (koMatch) return 'ko（韩语）';
+        if (ruMatch) return 'ru（俄语）';
+        if (arMatch) return 'ar（阿拉伯语）';
+        if (enMatch) return 'en（英语）';
+        return 'en（英语）';
+      })()
+    : 'en（英语）';
+
+  return `你是一位多语术语抽取专家，服务对象是以中文为母语的译者。本系统支持中、英、法、德、西、意、葡、日、韩、俄、阿共11种语言，术语库面向中文译者构建。
+
 现有术语库示例：${existingTermsSample || '无'}
 ${domainContext}${bilingualHint}
+检测到的外文语种：${foreignLangHint}
 
-要求输出JSON格式：[{"term_text": "...", "source_lang": "...", "score": 0-10, "target_term": "..."}]
-- 单语文本中，target_term 设为 null
-- 不要编造翻译
-- 只抽取有术语价值的词条`;
+一、语篇类型判断
+请自行判断文本的呈现方式，并据此调整抽取策略：
+
+· 单语文本：仅有一种语言，抽取该语言中的术语原文，无译文对应
+
+· 双语对照文本：两种语言分列或交替排列（如并列表格、交替段落、"中文 — 外文"标注格式等），应识别术语间的对译关系
+
+· 嵌入式括号标注文本（重中之重）：文本以某一种语言为主要叙事语言，首次出现的专业术语在其后紧跟着以括号标注的外文原文（格式如"中文术语（English term）"或"English term（中文术语）"），括号内的外文原文就是括号外术语的精准译文。必须将括号内外文本识别为target_term，并建立双向对译关系
+
+· 多语杂合文本：多种语言混杂出现在同一文本中，分别抽取各语种的术语，仅在有明确对译关系时建立对应
+
+· 术语对照列表：结构化格式（如编号式词汇表、表格对照、术语库导出数据等），每行或每格应识别为一个术语实体
+
+二、术语价值指引
+优先抽取对中文译者有翻译价值的术语，包括但不限于：
+
+· 专业领域概念：法律、技术、医学、金融等领域的特有名词
+· 文化负载词：带有特定文化背景的术语
+· 制度性概念：政策、法规、标准、组织名称等
+· 复合术语：由多个词构成的固定搭配
+· 具有歧义性或翻译难点的词
+· 术语首次出现时附有括号外文标注 → 翻译价值极高，必须建立完整的双向对译关系（zh→外文 + 外文→zh）
+
+对于过于普通的日常用语、缺乏语义完整性的片段，可酌情降低评分或排除。
+
+三、语言对限定规则
+本系统的有效语言范围包含以下11种：
+
+【中文】zh
+【外文】en（英语）、fr（法语）、de（德语）、es（西班牙语）、it（意大利语）、pt（葡萄牙语）、ja（日语）、ko（韩语）、ru（俄语）、ar（阿拉伯语）
+
+术语原文与译文之间，仅允许以下两种对应关系：
+
+→ 中文 → 外文：术语原文为中文（zh），对译为上述10种外文中的某一种
+→ 外文 → 中文：术语原文为上述10种外文中的某一种，对译为中文（zh）
+
+排除以下情况：中文对中文（zh→zh）、外文对外文（foreign→foreign，如 en→fr、ja→ko 等）。
+
+即使译文为空（null），上述语言对限定仍然适用：术语原文只能是中文或上述10种外文，译文空缺时仅记录语言方向，不改变限定范围。
+
+★ 特别强调：如果文本中存在嵌入式括号标注模式（如"争点排除（issue preclusion）"），括号内外的中英文互为精准译文。此时source_lang和target_lang必须分别设置为zh和对应外文（或反之），两者都必须返回非null值，切勿因source_lang被判定为zh就省去target_term的填写！理想情况下每个括号对应对应输出两个术语实体（zh→外文 + 外文→zh）。
+
+四、概念首倡语言（语言方向判断）
+在识别术语的语言方向时，不应机械地按照文本的字面语言标记，而应从概念起源的角度判断。例如：
+
+· 中国特有概念（如"社会主义核心价值观"、"乡村振兴"）→ 源语言应为 zh
+· 英美法系概念（如"common law"、"trust"）→ 源语言应为 en
+· 国际通用科技概念（如"artificial intelligence"、"blockchain"）→ 即使文本中写的是中文，源语言也倾向于 en
+· 日本动漫文化概念（如"anime"、"manga"）→ 源语言应为 ja
+
+五、输出格式说明
+返回一个 JSON 数组。数组中每个对象包含以下7个字段（这些描述仅供说明输出结构，不是需要抽取的内容，切勿将描述标签本身作为术语输出）：
+
+字段1 - 名称：原文文本，类型：字符串，必填。术语的原文文本，需语义完整。
+字段2 - 名称：源语言，类型：字符串，必填。术语原文的语言代码，取值范围：zh, en, fr, de, es, it, pt, ja, ko, ru, ar。
+字段3 - 名称：评分，类型：整数0-10，必填。基于专业性和翻译价值的综合评分。
+字段4 - 名称：译文，类型：字符串或null。译文文本。★ 嵌入式括号标注中括号内的文本是精准译文，此字段必须填写而非null；仅在文本确实不存在对译关系时才填null；决不可编造翻译。
+字段5 - 名称：译文语言，类型：字符串或null。译文语言代码，无译文时填 null。
+字段6 - 名称：置信度，类型：浮点数0.0-1.0。译文的置信度。嵌入式括号标注的直接对应关系，置信度设为 0.95-1.0；无译文时填 0。
+字段7 - 名称：来源，类型：字符串。嵌入式括号标注或其他显式对译关系填 "file"；AI推判的对译关系填 "ai"；无译文时填 "none"。
+字段8 - 名称：缩写建议，类型：字符串或null。当术语存在成熟通用的缩写形式时（如 "Artificial Intelligence" → "AI"），在此字段提供缩写；无通用缩写时填 null。
+
+JSON数组中每个对象的键名必须严格使用以下英文键名：term_text, source_lang, score, target_term, target_lang, translation_confidence, translation_source, abbreviation_suggestion
+
+六、注意事项
+· 自主决定抽取数量，不必人为限制
+· 不编造翻译，只抽取文本中实际存在的对译关系
+· 对于嵌入式括号标注（如"相互性（mutuality）"），括号内外的对译关系是确定且精准的，必须完整填入target_term，决不可省略
+· 缩写或首字母缩略词保持原文，源语言填写其实际所属语言
+· 确保原文文本是语义完整的术语，而非滑动窗口式的任意词组片段
+· 双语对照文本及嵌入式括号标注文本中，同一组术语对必须输出两条条目（zh→外文 + 外文→zh），因为双向对译关系在文本中有明确依据
+
+只返回纯净的 JSON 数组，不要包含任何解释、注释或额外文字。`;
 }
 
 function buildChunkPrompt(chunk: string, systemInstruction: string): string {
@@ -381,6 +523,20 @@ async function performAIExtraction(
       allAiTerms = smartDeduplicateTerms(allAiTerms);
     } else {
       allAiTerms = await callAITermExtraction(prompt, strategy.aiConfig, text, language);
+
+      if (allAiTerms.length === 0) {
+        console.warn(
+          `[AI Extractor] AI returned 0 terms from non-chunked text (${text.length} chars). ` +
+          `First 300 chars: "${text.slice(0, 300)}"`
+        );
+      }
+    }
+
+    // [新增] 噪声过滤：移除 JSON 字段名和代码标识符
+    const beforeNoiseFilter = allAiTerms.length;
+    allAiTerms = allAiTerms.filter(term => !isNoiseTerm(term.term_text));
+    if (beforeNoiseFilter !== allAiTerms.length) {
+      console.log(`[AI Extractor] Noise filter removed ${beforeNoiseFilter - allAiTerms.length} noise terms (JSON field names, etc.)`);
     }
 
     // 方案B: 概念首倡语言后处理

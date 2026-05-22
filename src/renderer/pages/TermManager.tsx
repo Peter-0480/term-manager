@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Layout,
   Table,
@@ -20,12 +20,13 @@ import {
   Radio,
   Divider
 } from 'antd';
-import { PlusOutlined, DeleteOutlined, EditOutlined, ReloadOutlined, EyeOutlined, MoreOutlined, ExportOutlined, SettingOutlined, SearchOutlined, LockOutlined, UnlockOutlined, RobotOutlined, StarOutlined } from '@ant-design/icons';
+import { PlusOutlined, DeleteOutlined, EditOutlined, ReloadOutlined, EyeOutlined, MoreOutlined, ExportOutlined, SettingOutlined, SearchOutlined, LockOutlined, UnlockOutlined, RobotOutlined, StarOutlined, InfoCircleOutlined } from '@ant-design/icons';
 import { ipcApi } from '../ipc-api';
 import logo from '../assets/logo.png';
 import TermDetail from '../components/TermDetail';
 import TranslationEditor from '../components/TranslationEditor';
 import type { TranslationEntry } from '../components/TranslationEditor';
+import SettingsFormContent from '../components/SettingsFormContent';
 import { getLanguageSelectOptions, getDefaultTargetLang, getSupportedTargetLanguages, MOTHER_TONGUE, FOREIGN_LANGUAGES, LANGUAGE_INFO, LANGUAGE_EMOJI, isForeignLanguage, isValidLanguagePair, determineTranslationDirection, getLanguagePairShortLabel, getLanguagePairLabel, getTargetLanguageSelectOptions } from '../utils/language-utils';
 import '../styles/TermManager.css';
 
@@ -386,6 +387,7 @@ const getDomainSelectOptions = (domainsList: Domain[]) => {
   ];
 };
 
+
 export default function TermManager() {
   const [terms, setTerms] = useState<Term[]>([]);
   const [domains, setDomains] = useState<Domain[]>([]);
@@ -398,6 +400,7 @@ export default function TermManager() {
   const [isFileExtractVisible, setIsFileExtractVisible] = useState(false);
   const [isUrlExtractVisible, setIsUrlExtractVisible] = useState(false);
   const [isSettingsVisible, setIsSettingsVisible] = useState(false);
+  const [isUsageNoticeVisible, setIsUsageNoticeVisible] = useState(false);
   const [isDetailVisible, setIsDetailVisible] = useState(false);
   const [selectedTerm, setSelectedTerm] = useState<Term | null>(null);
   const [extractText, setExtractText] = useState('');
@@ -405,7 +408,7 @@ export default function TermManager() {
   const [extractLanguage, setExtractLanguage] = useState<'auto' | 'en' | 'zh'>('auto');
   const [extractSourceType, setExtractSourceType] = useState<string>('plain_text');
   const [useAI, setUseAI] = useState(false);
-  const [aiConfig, setAIConfig] = useState<{ apiKey: string; endpoint: string; promptTemplate: string; dataPath: string }>({ 
+  const [aiConfig, setAIConfig] = useState<{ apiKey: string; endpoint: string; promptTemplate: string; dataPath: string; provider: string; model: string }>({ 
     apiKey: '', 
     endpoint: '', 
     promptTemplate: `请从以下文本中智能提取术语并提供详细信息：
@@ -435,7 +438,9 @@ export default function TermManager() {
 对于双语文件，请特别关注翻译对关系。
 
 返回格式为JSON数组，每个对象包含上述字段。`,
-    dataPath: ''
+    dataPath: '',
+    provider: 'deepseek',
+    model: 'deepseek-chat'
   });
   const [siderWidth, setSiderWidth] = useState<number>(350);
   const [siderCollapsed, setSiderCollapsed] = useState<boolean>(false);
@@ -594,6 +599,8 @@ export default function TermManager() {
   const [aiCommentText, setAiCommentText] = useState('');
   const [applyCommentToTerm, setApplyCommentToTerm] = useState(false);
   const [aiCompletionLoading, setAiCompletionLoading] = useState(false);
+  // 存储AI补全时实际使用的目标语言，确保展示与API调用一致
+  const [aiCompletionTargetLang, setAiCompletionTargetLang] = useState<string>('en');
   
   // 文件抽取进度状态
   const [fileExtractLoading, setFileExtractLoading] = useState(false);
@@ -613,6 +620,15 @@ export default function TermManager() {
   // 排序状态
   const [sortField, setSortField] = useState<string>('updated_at');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+  // 表头列筛选状态（全局服务端筛选）
+  const [columnFilters, setColumnFilters] = useState<{
+    sourceLang?: string[];
+    targetLang?: string[];
+    translationStatus?: 'all' | 'has' | 'none';
+    domains?: number[];
+    hasAbbreviation?: boolean | null;
+    favorite?: boolean;
+  }>({});
 
   const loadDomains = async () => {
     try {
@@ -693,7 +709,27 @@ export default function TermManager() {
       if (advancedSearchParams.favorite !== undefined) {
         searchParams.favorite = advancedSearchParams.favorite;
       }
-      
+
+      // 合并表头列筛选参数（全局服务端筛选）
+      if (columnFilters.sourceLang && columnFilters.sourceLang.length > 0) {
+        searchParams.sourceLangs = columnFilters.sourceLang;
+      }
+      if (columnFilters.targetLang && columnFilters.targetLang.length > 0) {
+        searchParams.translationLanguages = columnFilters.targetLang;
+      }
+      if (columnFilters.translationStatus && columnFilters.translationStatus !== 'all') {
+        searchParams.translationStatus = columnFilters.translationStatus;
+      }
+      if (columnFilters.domains && columnFilters.domains.length > 0) {
+        searchParams.domains = columnFilters.domains;
+      }
+      if (columnFilters.hasAbbreviation !== undefined && columnFilters.hasAbbreviation !== null) {
+        searchParams.hasAbbreviation = columnFilters.hasAbbreviation;
+      }
+      if (columnFilters.favorite !== undefined) {
+        searchParams.favorite = columnFilters.favorite;
+      }
+
       const res = await ipcApi.getTerms(searchParams);
       if (res.success) {
         setTerms(res.data || []);
@@ -778,7 +814,7 @@ export default function TermManager() {
 
   useEffect(() => {
     loadTerms();
-  }, [selectedDomain, keyword, page, pageSize]);
+  }, [selectedDomain, keyword, page, pageSize, columnFilters]);
 
   // 拖拽事件处理
   useEffect(() => {
@@ -828,10 +864,10 @@ export default function TermManager() {
     if (!config.apiKey || config.apiKey.trim().length < 3) {
       return 'needs-config';
     }
-    if (!config.endpoint || config.endpoint.trim().length < 2) {
+    // 如果配置了 provider，则使用 provider 的内置 endpoint；否则检查 endpoint
+    if (!config.provider && (!config.endpoint || config.endpoint.trim().length < 2)) {
       return 'needs-config';
     }
-    // endpoint可以是模型名称（如"gpt-4"）或URL
     return 'ready';
   };
 
@@ -843,7 +879,9 @@ export default function TermManager() {
           apiKey: res.data.apiKey || '',
           endpoint: res.data.endpoint || '',
           promptTemplate: res.data.promptTemplate || aiConfig.promptTemplate,
-          dataPath: res.data.dataPath || ''
+          dataPath: res.data.dataPath || '',
+          provider: res.data.provider || '',
+          model: res.data.model || ''
         };
         setAIConfig(newConfig);
         
@@ -864,7 +902,7 @@ export default function TermManager() {
     }
   };
 
-  const saveAIConfig = async (values: { apiKey: string; endpoint: string; promptTemplate: string; dataPath: string }) => {
+  const saveAIConfig = async (values: { apiKey: string; endpoint: string; promptTemplate: string; dataPath: string; provider: string; model: string }) => {
     try {
       const res = await ipcApi.setAIConfig(values);
       if (res.success) {
@@ -1973,17 +2011,19 @@ export default function TermManager() {
     try {
       console.log('Requesting AI suggestion for term:', term);
 
-      // 确定目标语言（译入语）：强制标准化目标语言，确保外文术语目标语为中文，中文术语目标语为外文
-      // 修复问题：不使用全局设置，而是根据术语的源语言强制标准化
+      // 确定目标语言（译入语）：与表格列渲染逻辑保持一致，确保AI补全语种与界面显示语种一致
+      // 优先遵循当前语种筛选条件，否则使用全局目标语言设置
       let targetLang: string;
 
-      if (term.source_lang === 'zh') {
-        // 中文术语：默认使用英文作为目标语言
-        // 如果术语已有目标语言且是有效的外文（非中文），使用它
-        if (term.target_lang && term.target_lang !== 'zh' && getSupportedTargetLanguages('zh').includes(term.target_lang)) {
-          targetLang = term.target_lang;
+      const filteredLangs = columnFilters.targetLang;
+      if (filteredLangs && filteredLangs.length === 1) {
+        // 单一语种筛选：使用筛选语种作为AI补全目标语言
+        targetLang = filteredLangs[0];
+      } else if (term.source_lang === 'zh') {
+        // 中文术语：使用用户设置的全局目标语言（如果是外文），否则默认英文
+        if (globalTargetLang && globalTargetLang !== 'zh' && getSupportedTargetLanguages('zh').includes(globalTargetLang)) {
+          targetLang = globalTargetLang;
         } else {
-          // 默认使用英文，确保是外文
           targetLang = 'en';
         }
       } else {
@@ -1993,13 +2033,19 @@ export default function TermManager() {
 
       console.log('AI补全目标语言（标准化后）:', targetLang);
 
+      // 存储实际使用的目标语言，确保展示与API调用一致
+      setAiCompletionTargetLang(targetLang);
+
+      // 检查针对目标语种是否已有译文（使用 getTermTranslation 而非仅检查 legacy target_text）
+      const termHasTranslation = !!getTermTranslation(term, targetLang);
+      
       // 调用AI服务获取建议
       const res = await ipcApi.getAITermSuggestion({
         termId: term.id,
         termText: term.term_text,
         sourceLang: term.source_lang,
         targetLang: targetLang, // 使用标准化后的译入语
-        hasTranslation: !!term.target_text,
+        hasTranslation: termHasTranslation,
         hasDomain: !!term.domain_id
       });
 
@@ -2039,10 +2085,19 @@ export default function TermManager() {
     try {
       // 应用AI建议（译文和缩写）
       if (aiSuggestions) {
-        // 应用译文建议
-        if (aiSuggestions.translation && !currentTermForAI.target_text) {
+        // 应用译文建议：仅当针对当前目标语种缺少译文时才应用
+        const termMissingTranslation = !getTermTranslation(currentTermForAI, aiCompletionTargetLang);
+        if (aiSuggestions.translation && termMissingTranslation) {
           updates.target_text = aiSuggestions.translation.text;
           updates.target_lang = aiSuggestions.translation.lang || currentTermForAI.target_lang;
+          // 同时将译文写入 translations 数组，确保多语种数据结构完整
+          if (!updates.translations) updates.translations = [];
+          updates.translations.push({
+            language_code: aiSuggestions.translation.lang || aiCompletionTargetLang,
+            text: aiSuggestions.translation.text,
+            confidence: aiSuggestions.translation.confidence || 0.8,
+            source: 'ai'
+          });
           console.log('应用译文建议:', aiSuggestions.translation.text);
           hasUpdates = true;
         }
@@ -2119,10 +2174,19 @@ export default function TermManager() {
       const otherUpdates: any = {};
       let otherHasUpdates = false;
       
-      // 检查是否有译文更新
-      if (aiSuggestions?.translation && !currentTermForAI!.target_text) {
+      // 检查是否有译文更新：仅当针对当前目标语种缺少译文时才应用
+      const termMissingTranslation = !getTermTranslation(currentTermForAI!, aiCompletionTargetLang);
+      if (aiSuggestions?.translation && termMissingTranslation) {
         otherUpdates.target_text = aiSuggestions.translation.text;
         otherUpdates.target_lang = aiSuggestions.translation.lang || currentTermForAI!.target_lang;
+        // 同时将译文写入 translations 数组，确保多语种数据结构完整
+        if (!otherUpdates.translations) otherUpdates.translations = [];
+        otherUpdates.translations.push({
+          language_code: aiSuggestions.translation.lang || aiCompletionTargetLang,
+          text: aiSuggestions.translation.text,
+          confidence: aiSuggestions.translation.confidence || 0.8,
+          source: 'ai'
+        });
         otherHasUpdates = true;
       }
       
@@ -2174,9 +2238,7 @@ export default function TermManager() {
         { text: '韩文', value: 'ko' },
         { text: '阿拉伯文', value: 'ar' }
       ],
-      onFilter: (value: React.Key | boolean, record: Term) => {
-        return record.source_lang === value;
-      },
+      filteredValue: columnFilters.sourceLang || null,
       filterIcon: (filtered: boolean) => (
         <SearchOutlined style={{ color: filtered ? '#1890ff' : undefined }} />
       ),
@@ -2214,8 +2276,8 @@ export default function TermManager() {
         // 译文状态选项
         const translationStatusOptions = [
           { label: '全部', value: 'all' },
-          { label: '有译文', value: 'has_translation' },
-          { label: '无译文', value: 'no_translation' }
+          { label: '有译文', value: 'has' },
+          { label: '无译文', value: 'none' }
         ];
         
         return (
@@ -2250,7 +2312,19 @@ export default function TermManager() {
             <Space>
               <Button
                 type="primary"
-                onClick={() => confirm()}
+                onClick={() => {
+                  // 解析当前 filterValue 并更新 columnFilters
+                  const parsed = filterValue;
+                  const newTargetLang = parsed.language && parsed.language.length > 0 ? parsed.language : undefined;
+                  const newTranslationStatus = parsed.translationStatus || 'all';
+                  setColumnFilters(prev => ({
+                    ...prev,
+                    targetLang: newTargetLang,
+                    translationStatus: newTranslationStatus
+                  }));
+                  setPage(1);
+                  confirm();
+                }}
                 size="small"
                 style={{ width: 90 }}
               >
@@ -2260,6 +2334,12 @@ export default function TermManager() {
                 onClick={() => {
                   // 重置为默认值
                   setSelectedKeys([JSON.stringify({ language: [], translationStatus: 'all' })]);
+                  setColumnFilters(prev => ({
+                    ...prev,
+                    targetLang: undefined,
+                    translationStatus: undefined
+                  }));
+                  setPage(1);
                   clearFilters();
                 }}
                 size="small"
@@ -2271,63 +2351,47 @@ export default function TermManager() {
           </div>
         );
       },
+      filteredValue: (
+        (columnFilters.targetLang && columnFilters.targetLang.length > 0) || 
+        (columnFilters.translationStatus && columnFilters.translationStatus !== 'all')
+      ) ? [JSON.stringify({ language: columnFilters.targetLang || [], translationStatus: columnFilters.translationStatus || 'all' })] : null,
       filterIcon: (filtered: boolean) => (
         <SearchOutlined style={{ color: filtered ? '#1890ff' : undefined }} />
       ),
-      onFilter: (value: React.Key | boolean, record: Term) => {
-        if (!value) return true;
-        
-        try {
-          const filterValue = JSON.parse(String(value));
-          const { language = [], translationStatus = 'all' } = filterValue;
-          
-          // 语种筛选逻辑
-          let languageMatch = true;
-          if (language.length > 0) {
-            // 如果选择了语种，则记录的目标语言必须匹配其中一个
-            languageMatch = record.target_lang ? language.includes(record.target_lang) : false;
-          }
-          
-          // 译文状态筛选逻辑
-          let translationStatusMatch = true;
-          if (translationStatus === 'has_translation') {
-            translationStatusMatch = !!(record.target_text && record.target_text.trim() !== '');
-          } else if (translationStatus === 'no_translation') {
-            translationStatusMatch = !record.target_text || record.target_text.trim() === '';
-          }
-          
-          // 两个条件都需要满足（AND逻辑）
-          return languageMatch && translationStatusMatch;
-        } catch (error) {
-          console.error('Filter parsing error:', error);
-          return true;
-        }
-      },
       render: (text: string, record: Term) => {
-        // 获取当前显示的翻译
-        const displayedTranslation = getDisplayedTranslation(record, globalTargetLang);
+        // 优先遵循当前语种筛选条件，实现筛选语种与显示语种的一致性
+        const filteredLangs = columnFilters.targetLang;
+        let displayLang: string;
+        let displayedTranslation: string | undefined;
         
-        // 根据getDisplayedTranslation的内部逻辑确定实际显示的语言
-        let targetLang: string;
-        if (record.source_lang === 'zh') {
-          // 中文术语：可以使用用户指定的目标语言（如果是外文），否则使用默认英文
-          if (globalTargetLang && globalTargetLang !== 'zh' && getSupportedTargetLanguages('zh').includes(globalTargetLang)) {
-            targetLang = globalTargetLang;
-          } else {
-            // 默认使用英文，确保是外文
-            targetLang = 'en';
-          }
+        if (filteredLangs && filteredLangs.length === 1) {
+          // 单一语种筛选：优先显示被筛选语种的翻译文本和语言标签
+          displayLang = filteredLangs[0];
+          displayedTranslation = getTermTranslation(record, displayLang);
         } else {
-          // 外文术语：始终显示中文翻译，忽略用户设置
-          targetLang = 'zh';
+          // 无筛选或多语种筛选：回退到原有的 getDisplayedTranslation 逻辑
+          displayedTranslation = getDisplayedTranslation(record, globalTargetLang);
+          
+          if (record.source_lang === 'zh') {
+            // 中文术语：可以使用用户指定的目标语言（如果是外文），否则使用默认英文
+            if (globalTargetLang && globalTargetLang !== 'zh' && getSupportedTargetLanguages('zh').includes(globalTargetLang)) {
+              displayLang = globalTargetLang;
+            } else {
+              // 默认使用英文，确保是外文
+              displayLang = 'en';
+            }
+          } else {
+            // 外文术语：始终显示中文翻译，忽略用户设置
+            displayLang = 'zh';
+          }
         }
         
         if (displayedTranslation) {
           // 有译文：显示语言标签和译文
-          return <><Tag color="green">{targetLang}</Tag>{displayedTranslation}</>;
+          return <><Tag color="green">{displayLang}</Tag>{displayedTranslation}</>;
         } else {
           // 无译文：显示语言标签和待翻译状态（消除空状态）
-          return <><Tag color="orange">{targetLang}</Tag><span style={{color: '#999', fontStyle: 'italic'}}>待翻译</span></>;
+          return <><Tag color="orange">{displayLang}</Tag><span style={{color: '#999', fontStyle: 'italic'}}>待翻译</span></>;
         }
       }
     },
@@ -2337,20 +2401,7 @@ export default function TermManager() {
       key: 'domain_id',
       width: 120,
       filters: getDomainFilterOptions(domains),
-      onFilter: (value: React.Key | boolean, record: Term) => {
-        // 处理特殊值：0=全部（显示所有记录），-1=未分类（null）
-        // 注意：value可能是字符串或数字，需要转换为数字比较
-        const numValue = Number(value);
-        if (numValue === 0) {
-          return true; // 全部：不过滤
-        } else if (numValue === -1) {
-          return record.domain_id === null || record.domain_id === undefined;
-        } else {
-          // 获取选定分类及其所有子分类的ID，检查术语的domain_id是否在其中
-          const selectedDomainIds = getAllDescendantDomainIds(numValue, domains);
-          return record.domain_id !== undefined && selectedDomainIds.includes(record.domain_id);
-        }
-      },
+      filteredValue: columnFilters.domains?.map(v => v as React.Key) || null,
       filterMultiple: true,
       filterIcon: (filtered: boolean) => (
         <SearchOutlined style={{ color: filtered ? '#1890ff' : undefined }} />
@@ -2376,14 +2427,7 @@ export default function TermManager() {
         { text: '有简称', value: 'has_abbreviation' },
         { text: '无简称', value: 'no_abbreviation' }
       ],
-      onFilter: (value: React.Key | boolean, record: Term) => {
-        if (value === 'has_abbreviation') {
-          return !!record.abbreviation && record.abbreviation.trim() !== '';
-        } else if (value === 'no_abbreviation') {
-          return !record.abbreviation || record.abbreviation.trim() === '';
-        }
-        return true;
-      },
+      filteredValue: columnFilters.hasAbbreviation === true ? ['has_abbreviation' as React.Key] : columnFilters.hasAbbreviation === false ? ['no_abbreviation' as React.Key] : null,
       filterIcon: (filtered: boolean) => (
         <SearchOutlined style={{ color: filtered ? '#1890ff' : undefined }} />
       ),
@@ -2395,17 +2439,10 @@ export default function TermManager() {
       key: 'favorite',
       width: 80,
       filters: [
-        { text: '已收藏', value: true },
-        { text: '未收藏', value: false }
+        { text: '已收藏', value: 'true' },
+        { text: '未收藏', value: 'false' }
       ],
-      onFilter: (value: React.Key | boolean, record: Term) => {
-        if (value === true) {
-          return !!record.favorite;
-        } else if (value === false) {
-          return !record.favorite;
-        }
-        return true;
-      },
+      filteredValue: columnFilters.favorite === true ? ['true' as React.Key] : columnFilters.favorite === false ? ['false' as React.Key] : null,
       filterIcon: (filtered: boolean) => (
         <SearchOutlined style={{ color: filtered ? '#1890ff' : undefined }} />
       ),
@@ -2429,11 +2466,31 @@ export default function TermManager() {
       fixed: 'right' as const,
       render: (_: any, record: Term) => {
         // 判断术语是否需要AI补全建议
+        // 与"术语译文"列使用相同逻辑确定当前展示语种
+        const filteredLangs = columnFilters.targetLang;
+        let displayLangForAI: string;
+        let displayedTranslationForAI: string | undefined;
+        
+        if (filteredLangs && filteredLangs.length === 1) {
+          displayLangForAI = filteredLangs[0];
+          displayedTranslationForAI = getTermTranslation(record, displayLangForAI);
+        } else {
+          displayedTranslationForAI = getDisplayedTranslation(record, globalTargetLang);
+          if (record.source_lang === 'zh') {
+            if (globalTargetLang && globalTargetLang !== 'zh' && getSupportedTargetLanguages('zh').includes(globalTargetLang)) {
+              displayLangForAI = globalTargetLang;
+            } else {
+              displayLangForAI = 'en';
+            }
+          } else {
+            displayLangForAI = 'zh';
+          }
+        }
+        
         // 检查同语互译：如果目标语言与源语言相同，视为无效翻译
-        const hasSameLangTranslation = record.target_text && record.target_lang && record.target_lang === record.source_lang;
-        // 检查翻译是否有效：有翻译文本且不是同语互译
-        const hasValidTranslation = record.target_text && !hasSameLangTranslation;
-        const needsAICompletion = !record.locked && (!hasValidTranslation || !record.domain_id);
+        const hasSameLangTranslationForAI = displayedTranslationForAI && record.source_lang === displayLangForAI;
+        const hasValidTranslationForAI = !!displayedTranslationForAI && !hasSameLangTranslationForAI;
+        const needsAICompletion = !record.locked && (!hasValidTranslationForAI || !record.domain_id);
         
         return (
           <Space>
@@ -2443,18 +2500,6 @@ export default function TermManager() {
               icon={<EyeOutlined />}
               onClick={() => openTermDetail(record)}
             />
-            {!record.locked && (
-              <Button
-                size="small"
-                icon={<EditOutlined />}
-                onClick={() => {
-                  form.setFieldsValue(record);
-                  setEditingTermId(record.id); // 设置编辑模式
-                  setIsModalVisible(true);
-                }}
-                title="编辑术语"
-              />
-            )}
             {needsAICompletion && (
               <Button
                 size="small"
@@ -2655,6 +2700,14 @@ export default function TermManager() {
               导出术语
             </Button>
             
+            {/* 使用须知按钮 */}
+            <Button 
+              icon={<InfoCircleOutlined />}
+              onClick={() => setIsUsageNoticeVisible(true)}
+            >
+              使用须知
+            </Button>
+            
             {/* 系统设置按钮 */}
             <Button 
               icon={<SettingOutlined />}
@@ -2751,7 +2804,12 @@ export default function TermManager() {
               if (node.key === 0) {
                 return (
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <span>{node.title}</span>
+                    <div style={{ display: 'flex', alignItems: 'center' }}>
+                      <span>{node.title}</span>
+                      <Tag color="default" style={{ marginLeft: 8, fontSize: 12 }}>
+                        {(node as any).termCount || 0}
+                      </Tag>
+                    </div>
                     <Button 
                       type="text" 
                       size="small"
@@ -2768,7 +2826,18 @@ export default function TermManager() {
               }
               
               const domain = domains.find(d => d.id === node.key);
-              if (!domain) return <span>{node.title}</span>;
+              if (!domain) {
+                return (
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center' }}>
+                      <span>{node.title}</span>
+                      <Tag color="default" style={{ marginLeft: 8, fontSize: 12 }}>
+                        {(node as any).termCount || 0}
+                      </Tag>
+                    </div>
+                  </div>
+                );
+              }
               
               // 检查当前节点是否处于编辑模式
               const isEditing = editingDomainId === domain.id;
@@ -3035,6 +3104,43 @@ export default function TermManager() {
               }
             }}
             scroll={{ x: 960, y: 'calc(100vh - 220px)' }}
+            onChange={(pagination, filters: any) => {
+              const newFilters: any = {};
+              // 术语原文列：sourceLang（dataIndex 为 term_text，筛选 value 为语种代码）
+              if (filters.term_text && filters.term_text.length > 0) {
+                newFilters.sourceLang = filters.term_text as string[];
+              } else {
+                newFilters.sourceLang = undefined;
+              }
+              // 领域列：domains
+              if (filters.domain_id && filters.domain_id.length > 0) {
+                newFilters.domains = (filters.domain_id as string[]).map(Number);
+              } else {
+                newFilters.domains = undefined;
+              }
+              // 简称列：hasAbbreviation
+              if (filters.abbreviation && filters.abbreviation.length > 0) {
+                newFilters.hasAbbreviation = filters.abbreviation.includes('has_abbreviation') ? true : 
+                                               filters.abbreviation.includes('no_abbreviation') ? false : null;
+              } else {
+                newFilters.hasAbbreviation = undefined;
+              }
+              // 收藏列：favorite
+              if (filters.favorite && filters.favorite.length > 0) {
+                newFilters.favorite = filters.favorite.includes('true') ? true : 
+                                       filters.favorite.includes('false') ? false : undefined;
+              } else {
+                newFilters.favorite = undefined;
+              }
+              // 检查筛选条件是否实际发生变化（避免分页操作时误重置页码）
+              const hasFilterChange = Object.keys(newFilters).some(key => {
+                return JSON.stringify(newFilters[key]) !== JSON.stringify((columnFilters as any)[key]);
+              });
+              setColumnFilters(prev => ({ ...prev, ...newFilters }));
+              if (hasFilterChange) {
+                setPage(1);
+              }
+            }}
           />
         </Content>
       </Layout>
@@ -3135,18 +3241,8 @@ export default function TermManager() {
               borderRadius: 8,
               border: '1px solid #e8e8e8'
             }}>
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ 
-                  width: 48, 
-                  height: 48, 
-                  borderRadius: '50%', 
-                  border: '4px solid #f0f0f0',
-                  borderTop: '4px solid #1890ff',
-                  margin: '0 auto',
-                  animation: 'spin 1s linear infinite'
-                }} />
-              </div>
-              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+              <Spin size="large" style={{ marginBottom: 16 }} />
+              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, marginTop: 16 }}>
                 正在处理文本...
               </div>
               <div style={{ fontSize: 14, color: '#666', marginBottom: 16 }}>
@@ -3452,26 +3548,8 @@ export default function TermManager() {
               borderRadius: 8,
               border: '1px solid #e8e8e8'
             }}>
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ 
-                  width: 48, 
-                  height: 48, 
-                  borderRadius: '50%', 
-                  border: '4px solid #f0f0f0',
-                  borderTop: '4px solid #1890ff',
-                  margin: '0 auto',
-                  animation: 'spin 1s linear infinite'
-                }} />
-                <style>
-                  {`
-                    @keyframes spin {
-                      0% { transform: rotate(0deg); }
-                      100% { transform: rotate(360deg); }
-                    }
-                  `}
-                </style>
-              </div>
-              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+              <Spin size="large" style={{ marginBottom: 16 }} />
+              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, marginTop: 16 }}>
                 正在抓取网页...
               </div>
               <div style={{ fontSize: 14, color: '#666', marginBottom: 16 }}>
@@ -3742,26 +3820,8 @@ export default function TermManager() {
               borderRadius: 8,
               border: '1px solid #e8e8e8'
             }}>
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ 
-                  width: 48, 
-                  height: 48, 
-                  borderRadius: '50%', 
-                  border: '4px solid #f0f0f0',
-                  borderTop: '4px solid #1890ff',
-                  margin: '0 auto',
-                  animation: 'spin 1s linear infinite'
-                }} />
-                <style>
-                  {`
-                    @keyframes spin {
-                      0% { transform: rotate(0deg); }
-                      100% { transform: rotate(360deg); }
-                    }
-                  `}
-                </style>
-              </div>
-              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+              <Spin size="large" style={{ marginBottom: 16 }} />
+              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, marginTop: 16 }}>
                 正在处理文件...
               </div>
               <div style={{ fontSize: 14, color: '#666', marginBottom: 16 }}>
@@ -3963,20 +4023,26 @@ export default function TermManager() {
         title="系统设置"
         open={isSettingsVisible}
         onCancel={() => setIsSettingsVisible(false)}
-        onOk={() => {
-          settingsForm.validateFields().then((values) => {
-            saveAIConfig(values as any);
-          });
-        }}
+        width={600}
         footer={[
           <Button key="test" onClick={async () => {
             try {
               const values = await settingsForm.validateFields();
-              const res = await ipcApi.testAIConnection(values);
+              // 构建测试用的完整配置：如果选了 provider 则用其 endpoint
+              const testValues = { ...values };
+              if (testValues.provider && testValues.provider !== 'custom' && !testValues.endpoint) {
+                // 使用 provider 的默认 endpoint
+                const provList = await ipcApi.getAIProviders();
+                if (provList.success && provList.data) {
+                  const provInfo = provList.data[testValues.provider];
+                  if (provInfo) testValues.endpoint = provInfo.endpoint;
+                }
+              }
+              const res = await ipcApi.testAIConnection(testValues);
               if (res.success) {
-                message.success(`连接测试成功: ${res.data.message}`);
+                message.success(`连接测试成功: ${res.data?.message || '连接正常'}`);
               } else {
-                message.error(`连接测试失败: ${res.data.message}`);
+                message.error(`连接测试失败: ${res.error || res.data?.message || '未知错误'}`);
               }
             } catch (error) {
               message.error('验证失败，请检查表单');
@@ -3992,39 +4058,35 @@ export default function TermManager() {
               saveAIConfig(values as any);
             });
           }}>
-            保存
+            保存设置
           </Button>,
         ]}
       >
-        <Form
-          form={settingsForm}
-          layout="vertical"
-          initialValues={aiConfig}
-        >
-          <Form.Item name="apiKey" label="AI API Key" rules={[{ required: true, message: '请填写API Key' }]}>
-            <Input.Password 
-              placeholder="请输入AI API Key" 
-              visibilityToggle={true}
-            />
-          </Form.Item>
-          <Form.Item name="endpoint" label="模型版本号" rules={[{ required: true, message: '请填写模型版本号' }]}>
-            <Input placeholder="例如：gpt-4, claude-3" />
-          </Form.Item>
-          <Form.Item name="promptTemplate" label="提示词模版">
-            <Input.TextArea rows={4} placeholder="系统将提供默认提示词，您可以修改" />
-          </Form.Item>
-          <Form.Item name="dataPath" label="术语数据保存地址">
-            <Input 
-              placeholder="留空使用默认地址，确保数据安全" 
-              addonAfter={
-                <Button type="link" onClick={selectDataPath} style={{ padding: '4px 8px' }}>
-                  选择
-                </Button>
-              }
-              readOnly
-            />
-          </Form.Item>
-        </Form>
+        <SettingsFormContent 
+          form={settingsForm} 
+          aiConfig={aiConfig} 
+          selectDataPath={selectDataPath} 
+        />
+      </Modal>
+
+      {/* 使用须知 Modal */}
+      <Modal
+        title="使用须知"
+        open={isUsageNoticeVisible}
+        onCancel={() => setIsUsageNoticeVisible(false)}
+        footer={[
+          <Button key="confirm" type="primary" onClick={() => setIsUsageNoticeVisible(false)}>
+            我知道了
+          </Button>,
+        ]}
+        width={600}
+      >
+        <div style={{ lineHeight: 2, fontSize: 14 }}>
+          <p>（1）本系统需互联网接入；</p>
+          <p>（2）初次使用，须加载由用户本人从大模型平台注册后获取的API密钥，作为AI算力调用凭证，以DeepSeek为例：从DeepSeek官网的API开放平台（<a href="https://platform.deepseek.com/usage" target="_blank" rel="noopener noreferrer">https://platform.deepseek.com/usage</a>）注册和申请API密钥（申请成功第一时间务必妥善保存，否则无法找回），并自行充值购买一定的token调用权限（对于文本处理而言，当前token调用所需花费极低），申请和充值成功后，请点击系统页面右上角"系统设置"按钮，将API密钥填入对应的信息栏，然后点击保存设置即可；</p>
+          <p>（3）使用过程中请及时导出并妥善保存相关术语库数据，以免因系统问题、网络问题、缓存自动清理规则或其他不可预见性问题造成相关内容丢失；本系统及其开发者不承担由此造成的任何损失；</p>
+          <p>（4）版权所有，本系统仅供学习研究使用，未经授权，禁止以任何形式对本系统任何部分进行商业化利用。</p>
+        </div>
       </Modal>
 
       {/* 智能抽取Modal */}
@@ -4079,26 +4141,8 @@ export default function TermManager() {
               borderRadius: 8,
               border: '1px solid #e8e8e8'
             }}>
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ 
-                  width: 48, 
-                  height: 48, 
-                  borderRadius: '50%', 
-                  border: '4px solid #f0f0f0',
-                  borderTop: '4px solid #1890ff',
-                  margin: '0 auto',
-                  animation: 'spin 1s linear infinite'
-                }} />
-                <style>
-                  {`
-                    @keyframes spin {
-                      0% { transform: rotate(0deg); }
-                      100% { transform: rotate(360deg); }
-                    }
-                  `}
-                </style>
-              </div>
-              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+              <Spin size="large" style={{ marginBottom: 16 }} />
+              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, marginTop: 16 }}>
                 正在智能分析...
               </div>
               <div style={{ fontSize: 14, color: '#666', marginBottom: 16 }}>
@@ -4452,89 +4496,68 @@ export default function TermManager() {
               </div>
               
               {/* 译文建议 */}
-              {aiSuggestions.translation && (
-                <div>
-                  <h4 style={{ marginBottom: 8 }}>译文建议</h4>
-                  <Input.TextArea
-                    rows={2}
-                    value={aiSuggestions.translation.text}
-                    onChange={(e) => setAiSuggestions({
-                      ...aiSuggestions,
-                      translation: { ...aiSuggestions.translation!, text: e.target.value }
-                    })}
-                    placeholder="AI建议的译文"
-                  />
-                  <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span>语言：</span>
-                    <Select
-                      value={aiSuggestions.translation.lang}
-                      onChange={(value) => setAiSuggestions({
+              <div>
+                <h4 style={{ marginBottom: 8 }}>译文建议</h4>
+                {aiSuggestions.translation ? (
+                  <>
+                    <Input.TextArea
+                      rows={2}
+                      value={aiSuggestions.translation.text}
+                      onChange={(e) => setAiSuggestions({
                         ...aiSuggestions,
-                        translation: { ...aiSuggestions.translation!, lang: value }
+                        translation: { ...aiSuggestions.translation!, text: e.target.value }
                       })}
-                      style={{ width: 120 }}
-                      options={[
-                        { label: '中文', value: 'zh' },
-                        { label: '英文', value: 'en' },
-                        { label: '日文', value: 'ja' },
-                        { label: '韩文', value: 'ko' },
-                        { label: '法文', value: 'fr' },
-                        { label: '德文', value: 'de' },
-                        { label: '西班牙文', value: 'es' }
-                      ]}
+                      placeholder="AI建议的译文"
                     />
-                    <span>置信度：{aiSuggestions.translation.confidence.toFixed(2)}</span>
+                    <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span>语言：</span>
+                      <Select
+                        value={aiSuggestions.translation.lang}
+                        onChange={(value) => setAiSuggestions({
+                          ...aiSuggestions,
+                          translation: { ...aiSuggestions.translation!, lang: value }
+                        })}
+                        style={{ width: 120 }}
+                        options={[
+                          { label: '中文', value: 'zh' },
+                          { label: '英文', value: 'en' },
+                          { label: '日文', value: 'ja' },
+                          { label: '韩文', value: 'ko' },
+                          { label: '法文', value: 'fr' },
+                          { label: '德文', value: 'de' },
+                          { label: '西班牙文', value: 'es' }
+                        ]}
+                      />
+                      <span>置信度：{aiSuggestions.translation.confidence.toFixed(2)}</span>
+                    </div>
+                    <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
+                      目标语言：根据当前设置，应为 
+                      <Tag color="blue" style={{ marginLeft: 4 }}>
+                        {aiCompletionTargetLang}
+                      </Tag>
+                      {aiSuggestions.translation.lang !== aiCompletionTargetLang && (
+                        <span style={{ marginLeft: 8, color: '#faad14' }}>
+                          （注意：当前选择与默认译入语不一致）
+                        </span>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ padding: '12px', backgroundColor: '#fffbe6', border: '1px solid #ffe58f', borderRadius: 4, color: '#ad8b00' }}>
+                    {(() => {
+                      const sourceLang = currentTermForAI?.source_lang || 'zh';
+                      if (sourceLang !== 'zh') {
+                        // 外文术语：目标语言应为中文，可以显示提示
+                        return 'AI暂未提供译文建议，您可以手动输入译文（中文）';
+                      }
+                      // 中文术语：目标语言应为外文，使用与API调用一致的aiCompletionTargetLang
+                      const langNames: Record<string, string> = { en: '英文', ja: '日文', ko: '韩文', fr: '法文', de: '德文', es: '西班牙文' };
+                      const langName = langNames[aiCompletionTargetLang] || aiCompletionTargetLang;
+                      return `AI暂未提供译文建议，您可以手动输入译文（${langName}）`;
+                    })()}
                   </div>
-                  <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
-                    目标语言：根据当前设置，应为 
-                    <Tag color="blue" style={{ marginLeft: 4 }}>
-                      {(() => {
-                        // 智能计算目标语言：外文术语→中文，中文术语→外文
-                        const sourceLang = currentTermForAI?.source_lang || 'zh';
-                        
-                        // 如果是外文术语（源语言≠zh），目标语言必须是中文
-                        if (sourceLang !== 'zh') {
-                          return 'zh';
-                        }
-                        
-                        // 中文术语：可以使用用户指定的全局目标语言（如果是外文）
-                        // 否则使用术语已有的目标语言，最后使用默认英文
-                        if (globalTargetLang && globalTargetLang !== 'zh' && getSupportedTargetLanguages('zh').includes(globalTargetLang)) {
-                          return globalTargetLang;
-                        }
-                        
-                        if (currentTermForAI?.target_lang && currentTermForAI.target_lang !== 'zh') {
-                          return currentTermForAI.target_lang;
-                        }
-                        
-                        return 'en';
-                      })()}
-                    </Tag>
-                    {aiSuggestions.translation.lang !== (() => {
-                        // 使用相同的逻辑计算默认目标语言
-                        const sourceLang = currentTermForAI?.source_lang || 'zh';
-                        
-                        if (sourceLang !== 'zh') {
-                          return 'zh';
-                        }
-                        
-                        if (globalTargetLang && globalTargetLang !== 'zh' && getSupportedTargetLanguages('zh').includes(globalTargetLang)) {
-                          return globalTargetLang;
-                        }
-                        
-                        if (currentTermForAI?.target_lang && currentTermForAI.target_lang !== 'zh') {
-                          return currentTermForAI.target_lang;
-                        }
-                        
-                        return 'en';
-                      })() && (
-                      <span style={{ marginLeft: 8, color: '#faad14' }}>
-                        （注意：当前选择与默认译入语不一致）
-                      </span>
-                    )}
-                  </div>
-                </div>
-              )}
+                )}
+              </div>
               
               {/* 简称建议 */}
               {aiSuggestions.abbreviation && (
@@ -4572,7 +4595,7 @@ export default function TermManager() {
                           termId: currentTermForAI.id,
                           termText: currentTermForAI.term_text,
                           sourceLang: currentTermForAI.source_lang,
-                          targetLang: currentTermForAI.source_lang === 'zh' ? 'en' : 'zh',
+                          targetLang: aiCompletionTargetLang,
                           hasTranslation: !!currentTermForAI.target_text,
                           hasDomain: !!currentTermForAI.domain_id
                         });

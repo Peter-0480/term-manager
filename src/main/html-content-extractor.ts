@@ -364,6 +364,272 @@ function isNoiseLine(line: string): boolean {
 }
 
 /**
+ * [P1增强] 从HTML中提取双语表格/列表的行对（保持中英配对结构）
+ * 用于双语网站（如有道单词表、中英对照新闻等）的结构化抽取
+ */
+export interface BilingualRowPair {
+  /** 源语言文本（通常为中文） */
+  source: string;
+  /** 目标语言文本（通常为英文） */
+  target: string;
+  /** 该行的原始HTML索引 */
+  rowIndex: number;
+}
+
+/**
+ * 检测HTML是否包含双语表格结构（含两种语言的表格/列表）
+ * 返回检测到的行配对列表
+ */
+export function extractBilingualTableRows(html: string): BilingualRowPair[] {
+  const pairs: BilingualRowPair[] = [];
+  
+  if (!html || html.length < 100) return pairs;
+  
+  // 清理脚本和样式
+  const cleaned = html
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[\s\S]*?>[\s\S]*?<\/noscript>/gi, '');
+  
+  // 策略1: 提取所有 <tr> 行，检测每行是否包含中英文混合
+  const trRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  let trMatch;
+  let rowIdx = 0;
+  const trPairs: BilingualRowPair[] = [];
+  
+  while ((trMatch = trRegex.exec(cleaned)) !== null) {
+    const rowContent = trMatch[1];
+    // 提取行内的纯文本（td/th内容）
+    const tdTexts: string[] = [];
+    const tdRegex = /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi;
+    let tdMatch;
+    while ((tdMatch = tdRegex.exec(rowContent)) !== null) {
+      const cellText = tdMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (cellText.length > 0) {
+        tdTexts.push(cellText);
+      }
+    }
+    
+    if (tdTexts.length >= 2) {
+      // 检测各单元格的语言
+      const zhCells: string[] = [];
+      const enCells: string[] = [];
+      for (const cell of tdTexts) {
+        const zhCount = (cell.match(/[\u4e00-\u9fa5]/g) || []).length;
+        const enCount = (cell.match(/[a-zA-Z]/g) || []).length;
+        if (zhCount > enCount && zhCount >= 1) zhCells.push(cell);
+        else if (enCount > zhCount && enCount >= 1) enCells.push(cell);
+      }
+      
+      // 如果同一行既有中文又有英文单元格 → 双语行对
+      if (zhCells.length > 0 && enCells.length > 0) {
+        trPairs.push({
+          source: zhCells[0],
+          target: enCells[0],
+          rowIndex: rowIdx,
+        });
+      }
+    }
+    rowIdx++;
+  }
+  
+  if (trPairs.length >= 3) {
+    console.log(`[HTML Bilingual Table] Found ${trPairs.length} table-row bilingual pairs`);
+    return trPairs;
+  }
+  
+  // 策略2: 提取 <li> 或 <div> 列表中包含分隔符（/ | · ：）的双语条目
+  const listItemRegex = /<(?:li|div|p|span|dd|dt)\b[^>]*>([\s\S]*?)<\/(?:li|div|p|span|dd|dt)>/gi;
+  let liMatch;
+  rowIdx = 0;
+  const liPairs: BilingualRowPair[] = [];
+  
+  while ((liMatch = listItemRegex.exec(cleaned)) !== null) {
+    const text = liMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (text.length < 3 || text.length > 200) continue;
+    
+    // 检测中英文分隔符模式：中文 / 英文, 中文 | 英文, 中文 · 英文
+    const separatorMatch = text.match(/^(.+?)\s*[\/\|·：:–—]\s*([a-zA-Z].+)$/);
+    if (separatorMatch) {
+      const left = separatorMatch[1].trim();
+      const right = separatorMatch[2].trim();
+      const leftZh = (left.match(/[\u4e00-\u9fa5]/g) || []).length;
+      const rightEn = (right.match(/[a-zA-Z]/g) || []).length;
+      
+      if (leftZh >= 1 && rightEn >= 1 && rightEn >= right.length * 0.4) {
+        liPairs.push({
+          source: left,
+          target: right,
+          rowIndex: rowIdx,
+        });
+      }
+    } else {
+      // 检测纯中文后跟纯英文的模式（可能在同个元素但不是分隔符分隔）
+      const zhPart = text.match(/[\u4e00-\u9fa5][\u4e00-\u9fa5\s，。、；：""''！？…—]+/);
+      const enPart = text.match(/[a-zA-Z][a-zA-Z\s\-.,;:!?()'"]{3,}/);
+      if (zhPart && enPart && zhPart.index! < enPart.index!) {
+        liPairs.push({
+          source: zhPart[0].trim(),
+          target: enPart[0].trim(),
+          rowIndex: rowIdx,
+        });
+      }
+    }
+    rowIdx++;
+  }
+  
+  if (liPairs.length >= 3) {
+    console.log(`[HTML Bilingual List] Found ${liPairs.length} list-item bilingual pairs`);
+    return liPairs;
+  }
+  
+  // 策略3: 尝试从简单文本中按行检测双语配对（中英交替行）
+  const flatText = simpleHtmlToText(html);
+  const lines = flatText.split('\n').filter(l => l.trim().length > 0);
+  const linePairs: BilingualRowPair[] = [];
+  
+  for (let i = 0; i < lines.length - 1; i++) {
+    const zhCount = (lines[i].match(/[\u4e00-\u9fa5]/g) || []).length;
+    const enCount = (lines[i].match(/[a-zA-Z]/g) || []).length;
+    const nextZhCount = (lines[i + 1].match(/[\u4e00-\u9fa5]/g) || []).length;
+    const nextEnCount = (lines[i + 1].match(/[a-zA-Z]/g) || []).length;
+    
+    // 检测交替模式：中文行 → 英文行
+    if (zhCount >= 2 && enCount <= zhCount * 0.3 && nextEnCount >= 2 && nextZhCount <= nextEnCount * 0.3) {
+      linePairs.push({
+        source: lines[i].trim(),
+        target: lines[i + 1].trim(),
+        rowIndex: i,
+      });
+      i++; // 跳过下一行
+    }
+  }
+  
+  if (linePairs.length >= 3) {
+    console.log(`[HTML Bilingual Lines] Found ${linePairs.length} line-alternating bilingual pairs`);
+    return linePairs;
+  }
+  
+  return pairs;
+}
+
+/**
+ * 将双语行对转换为便于术语抽取的格式化文本
+ * 每行格式：中文术语 | 英文术语（保留配对关系）
+ */
+export function formatBilingualPairsForExtraction(pairs: BilingualRowPair[]): string {
+  return pairs
+    .filter(p => p.source.length > 0 && p.target.length > 0)
+    .map(p => `${p.source} | ${p.target}`)
+    .join('\n');
+}
+
+/**
+ * [优化] 将HTML精简为适合提交AI的结构化文本
+ * - 保留块级标签（article, section, p, div, table, ul, li, h1-h6, strong, em, a, span等）
+ * - 移除 script, style, noscript, svg, nav, footer, header（非正文结构标签）
+ * - 移除HTML注释
+ * - 移除所有标签属性（保留标签名和文本）
+ * - 压缩多余空白
+ * - 将HTML截断至maxChars（默认15000字符，约7500 tokens）
+ */
+export function sanitizeHtmlForAI(html: string, maxChars: number = 15000): string {
+  if (!html || html.length < 50) return html || '';
+
+  let cleaned = html
+    // 移除注释
+    .replace(/<!--[\s\S]*?-->/g, '')
+    // 移除 script / style / noscript / svg 块
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+    // 移除整个 nav / footer / header 块（非正文结构）
+    .replace(/<nav[\s\S]*?<\/nav>/gi, ' ')
+    .replace(/<footer[\s\S]*?<\/footer>/gi, ' ')
+    .replace(/<header[\s\S]*?<\/header>/gi, ' ');
+
+  // 保留块级标签但移除属性
+  const preserveTags = [
+    'article', '/article',
+    'section', '/section',
+    'main', '/main',
+    'div', '/div',
+    'p', '/p',
+    'table', '/table',
+    'thead', '/thead',
+    'tbody', '/tbody',
+    'tr', '/tr',
+    'td', '/td',
+    'th', '/th',
+    'ul', '/ul',
+    'ol', '/ol',
+    'li', '/li',
+    'dl', '/dl',
+    'dt', '/dt',
+    'dd', '/dd',
+    'h1', '/h1', 'h2', '/h2', 'h3', '/h3', 'h4', '/h4', 'h5', '/h5', 'h6', '/h6',
+    'strong', '/strong',
+    'em', '/em',
+    'b', '/b',
+    'i', '/i',
+    'a', '/a',
+    'span', '/span',
+    'code', '/code',
+    'pre', '/pre',
+    'blockquote', '/blockquote',
+    'br',
+  ];
+
+  // 将所有保留标签的属性去除
+  for (const tag of preserveTags) {
+    if (tag.startsWith('/')) {
+      // 闭合标签：</tagname> 不需要处理属性
+      continue;
+    }
+    if (tag === 'br') {
+      cleaned = cleaned.replace(/<br\b[^>]*\/?>/gi, '<br>');
+      continue;
+    }
+    // 开标签：<tagname attr="..."> -> <tagname>
+    const openTagRegex = new RegExp(`<${tag}\\b[^>]*>`, 'gi');
+    cleaned = cleaned.replace(openTagRegex, `<${tag}>`);
+  }
+
+  // 移除所有未被保留的HTML标签（转换为空格）
+  cleaned = cleaned.replace(/<[^>]+>/g, ' ');
+
+  // 解码常见HTML实体（保留文本可读性）
+  cleaned = cleaned
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/</gi, '<')
+    .replace(/>/gi, '>')
+    .replace(/&/gi, '&')
+    .replace(/"/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/');
+
+  // 规范化空白：压缩连续空格和空行
+  cleaned = cleaned
+    .replace(/\u00A0/g, ' ')
+    .replace(/\u3000/g, ' ')
+    .replace(/\t+/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  // 截断到maxChars
+  if (cleaned.length > maxChars) {
+    cleaned = cleaned.substring(0, maxChars);
+    console.log(`[HTML Sanitizer] Truncated to ${maxChars} chars for AI context window`);
+  }
+
+  console.log(`[HTML Sanitizer] Reduced HTML from ${html.length} to ${cleaned.length} chars (${(cleaned.length / html.length * 100).toFixed(1)}%)`);
+  return cleaned;
+}
+
+/**
  * 简化版的HTML文本提取（用于不支持内容区提取的场景）
  * 仅移除脚本/样式/标签，不做内容过滤
  */
@@ -376,6 +642,7 @@ export function simpleHtmlToText(html: string): string {
     .replace(/<\/p>/gi, '\n')
     .replace(/<\/div>/gi, '\n')
     .replace(/<\/li>/gi, '\n')
+    .replace(/<\/tr>/gi, '\n')
     .replace(/<\/section>/gi, '\n')
     .replace(/<\/blockquote>/gi, '\n')
     .replace(/<\/h[1-6]>/gi, '\n')

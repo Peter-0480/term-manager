@@ -75,6 +75,8 @@ contextBridge.exposeInMainWorld('termManager', {
 
   // AI配置测试
   testAIConnection: (config: any) => ipcRenderer.invoke('test-ai-connection', config),
+  // 获取支持的AI平台及其模型列表
+  getAIProviders: () => ipcRenderer.invoke('get-ai-providers'),
 
   // 语言对管理
   getLanguagePairs: () => ipcRenderer.invoke('get-language-pairs'),

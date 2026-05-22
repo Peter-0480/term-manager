@@ -64,8 +64,8 @@ export async function getAITermCompletionSuggestion(
   }
   
   try {
-    // 1. 如果需要翻译建议，调用AI翻译服务
-    if (!request.hasTranslation && request.sourceLang !== request.targetLang) {
+    // 1. 始终尝试提供翻译建议（即使术语已有译文，AI仍可提供参考译文）
+    if (request.sourceLang !== request.targetLang) {
       const translationResult = await getTranslationSuggestion(
         request.termText,
         request.sourceLang,
@@ -76,18 +76,36 @@ export async function getAITermCompletionSuggestion(
       
       if (translationResult) {
         response.translation = translationResult;
+      } else {
+        // AI翻译失败时提供降级翻译建议，确保译文建议槽位始终有内容
+        const fallbackText = generateFallbackTranslation(
+          request.termText,
+          request.sourceLang,
+          request.targetLang
+        );
+        if (fallbackText) {
+          response.translation = {
+            text: fallbackText,
+            lang: request.targetLang,
+            confidence: 0.3
+          };
+        }
       }
     }
     
-    // 2. 不再提供领域建议，保持未分类或既有分类
-    
-    // 3. 提供缩写建议
-    const abbreviationResult = getAbbreviationSuggestion(request.termText, config);
-    if (abbreviationResult) {
-      response.abbreviation = abbreviationResult;
+    // 2. 获取领域建议（如果术语没有领域信息）
+    if (!request.hasDomain) {
+      const domainResult = await getDomainSuggestion(
+        request.termText,
+        request.sourceLang,
+        config
+      );
+      if (domainResult) {
+        response.domain = domainResult;
+      }
     }
     
-    // 4. 提供术语定义建议（用于AI注释）
+    // 3. 获取术语定义建议
     const definitionResult = await getTermDefinitionSuggestion(
       request.termText,
       request.sourceLang,
@@ -478,8 +496,8 @@ function cleanTranslationText(text: string): string {
 function getFallbackSuggestions(request: AICompletionRequest): AICompletionResponse {
   const response: AICompletionResponse = {};
   
-  // 降级翻译建议
-  if (!request.hasTranslation && request.sourceLang !== request.targetLang) {
+  // 降级翻译建议 - 始终尝试提供译文建议
+  if (request.sourceLang !== request.targetLang) {
     const fallbackTranslation = generateFallbackTranslation(
       request.termText,
       request.sourceLang,

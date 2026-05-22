@@ -4,16 +4,28 @@
  * 支持文本型 PDF 和扫描型（图片）PDF，无需本地 OCR 引擎。
  *
  * 工作流：
- * 1. 将 PDF 文件分页渲染为 PNG 图像
+ * 1. 将 PDF 文件分页渲染为图像（PNG 优先，SVG 降级）
  * 2. 逐个页面作为图像发送给 AI 视觉模型
  * 3. AI 直接提取其中的专业术语并提供翻译建议
  * 4. 合并所有页面的结果并返回结构化 ExtractedTerm 数组
+ *
+ * 渲染优先级（图片型 PDF）：
+ *   Canvas 可用 → PNG 渲染 → AI Vision
+ *   Canvas 不可用 → SVG 渲染（零原生依赖）→ AI Vision
  */
 
 import fs from 'fs';
 import { AIConfig, getFullEndpoint } from './ai-client';
 import { ExtractedTerm } from './term-engine';
 import { APIResponseHandler } from './api-response-handler';
+import {
+  pdfjsLib,
+  getDocumentSafe,
+  renderPageToImage,
+  renderPageToSVG,
+  PDFJS_STANDARD_FONTS_URL,
+  getCanvasDiagnostics,
+} from './pdf-polyfills';
 
 export interface AIExtractionProgress {
   currentPage: number;
@@ -25,48 +37,6 @@ export interface AIExtractionProgress {
 export type AIExtractionProgressCallback = (progress: AIExtractionProgress) => void;
 
 /**
- * 将 PDF 文件的一页渲染为 PNG Buffer
- * 使用 pdfjs-dist 渲染页面 + node-canvas 输出 PNG
- */
-async function renderPDFPageAsImage(
-  pdfData: Uint8Array,
-  pageNum: number,
-  scale: number = 1.5
-): Promise<{ buffer: Buffer; width: number; height: number }> {
-  const { createRequire } = await import('module');
-  const nodeRequire = createRequire(import.meta.url || __filename);
-  const pdfjsLib: any = nodeRequire('pdfjs-dist/legacy/build/pdf.js');
-
-  const loadingTask = pdfjsLib.getDocument({ data: pdfData });
-  const pdf = await loadingTask.promise;
-  const page = await pdf.getPage(pageNum);
-  const viewport = page.getViewport({ scale });
-
-  // 使用 node-canvas 创建渲染画布
-  let canvas: any;
-  try {
-    // 尝试使用 node-canvas（如果已安装）
-    const { createCanvas } = nodeRequire('canvas');
-    canvas = createCanvas(viewport.width, viewport.height);
-  } catch {
-    // 降级：仅提取文本内容
-    console.warn(`[PDF AI Extractor] node-canvas not available, falling back to text extraction for page ${pageNum}`);
-    const textContent = await page.getTextContent();
-    const text = textContent.items.map((item: any) => item.str ?? '').join(' ');
-    return { buffer: Buffer.from(text, 'utf-8'), width: viewport.width, height: viewport.height };
-  }
-
-  const ctx = canvas.getContext('2d');
-  await page.render({
-    canvasContext: ctx,
-    viewport: viewport,
-  }).promise;
-
-  const buffer = canvas.toBuffer('image/png');
-  return { buffer, width: viewport.width, height: viewport.height };
-}
-
-/**
  * 将 Buffer 转换为 Base64 Data URL
  */
 function bufferToDataURL(buffer: Buffer, mimeType: string = 'image/png'): string {
@@ -75,16 +45,152 @@ function bufferToDataURL(buffer: Buffer, mimeType: string = 'image/png'): string
 }
 
 /**
+ * 将 SVG 字符串转为 Base64 Data URL
+ */
+function svgToDataURL(svgString: string): string {
+  const base64 = Buffer.from(svgString, 'utf-8').toString('base64');
+  return `data:image/svg+xml;base64,${base64}`;
+}
+
+/**
+ * 清理 SVG 字符串中的潜在问题（如非法的 XML 字符）
+ */
+function sanitizeSVG(svg: string): string {
+  return svg
+    .replace(/[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\u10000-\u10FFFF]/g, '')
+    .trim();
+}
+
+/**
+ * 将 PDF 文件的一页渲染为可发送给 AI 的图像数据
+ *
+ * 工作流：
+ *   1. 先用 getTextContent() 尝试读取文本层 → textFragments
+ *   2. 尝试 Canvas 渲染 → PNG buffer
+ *   3. Canvas 不可用时降级到 SVG 渲染 → SVG string
+ *   4. 最终返回统一的 { dataURL, mediaType, isImage } 描述
+ */
+interface PageRenderResult {
+  pageNum: number;
+  /** 可渲染的图像 dataURL（PNG 或 SVG） */
+  dataURL: string;
+  /** MIME 类型：image/png 或 image/svg+xml */
+  mediaType: 'image/png' | 'image/svg+xml';
+  /** 是否为图像（vs 纯文本降级） */
+  isImage: boolean;
+  /** 尺寸信息 */
+  width: number;
+  height: number;
+  /** 文本内容（如果有文本层的话） */
+  textContent: string;
+}
+async function renderPDFPage(
+  pdfData: Uint8Array,
+  pageNum: number,
+  scale: number = 1.5
+): Promise<PageRenderResult> {
+  const pdf = await getDocumentSafe({
+    data: pdfData,
+    standardFontDataUrl: PDFJS_STANDARD_FONTS_URL,
+  });
+  const page = await pdf.getPage(pageNum);
+
+  // 获取 viewport
+  let viewport: any;
+  if (typeof (page as any).getViewportRect === 'function') {
+    const rect = (page as any).getViewportRect({ scale });
+    viewport = { width: rect.width, height: rect.height };
+  } else {
+    viewport = page.getViewport({ scale });
+  }
+
+  // ── 先提取文本层 ──
+  let textContent = '';
+  try {
+    const tc = await page.getTextContent();
+    textContent = tc.items
+      .map((item: any) => item.str ?? '')
+      .join(' ')
+      .trim();
+  } catch {
+    textContent = '';
+  }
+
+  // ── 路径 A: Canvas → PNG（最优）──
+  try {
+    const pngBuffer = await renderPageToImage(page, scale);
+    const dataURL = bufferToDataURL(pngBuffer, 'image/png');
+    console.log(
+      `[PDF AI Extractor] Page ${pageNum}: rendered as ${viewport.width}x${viewport.height} PNG (${pngBuffer.length} bytes), text=${textContent.length} chars`
+    );
+    return {
+      pageNum,
+      dataURL,
+      mediaType: 'image/png',
+      isImage: true,
+      width: viewport.width,
+      height: viewport.height,
+      textContent,
+    };
+  } catch (canvasError: any) {
+    const msg = canvasError?.message || String(canvasError);
+    console.warn(
+      `[PDF AI Extractor] Page ${pageNum}: Canvas 渲染失败 → ${msg.substring(0, 120)}\n` +
+      `   尝试 SVG 降级渲染（零原生依赖）...`
+    );
+  }
+
+  // ── 路径 B: SVG 渲染（零原生依赖降级）──
+  try {
+    const svgString = await renderPageToSVG(page, scale);
+    const cleaned = sanitizeSVG(svgString);
+    const dataURL = svgToDataURL(cleaned);
+    console.log(
+      `[PDF AI Extractor] Page ${pageNum}: rendered as ${viewport.width}x${viewport.height} SVG (${cleaned.length} chars), text=${textContent.length} chars`
+    );
+    return {
+      pageNum,
+      dataURL,
+      mediaType: 'image/svg+xml',
+      isImage: true,
+      width: viewport.width,
+      height: viewport.height,
+      textContent,
+    };
+  } catch (svgError: any) {
+    const svgMsg = svgError?.message || String(svgError);
+    console.error(
+      `[PDF AI Extractor] Page ${pageNum}: SVG 渲染也失败 → ${svgMsg.substring(0, 120)}\n` +
+      `   回退到纯文本模式。`
+    );
+  }
+
+  // ── 路径 C: 纯文本降级 ──
+  console.log(
+    `[PDF AI Extractor] Page ${pageNum}: 无法渲染为图像，使用纯文本 (${textContent.length} chars)`
+  );
+  return {
+    pageNum,
+    dataURL: '',
+    mediaType: 'image/png',
+    isImage: false,
+    width: viewport.width,
+    height: viewport.height,
+    textContent,
+  };
+}
+
+/**
  * 调用 AI Vision API 从单页图像中提取术语
  * 支持 OpenAI Vision 格式和 Anthropic Vision 格式
  */
 async function extractTermsFromPageImageViaAI(
-  imageDataURL: string,
-  pageNum: number,
+  pageResult: PageRenderResult,
   totalPages: number,
   language: string,
   aiConfig: AIConfig
 ): Promise<ExtractedTerm[]> {
+  const { dataURL, mediaType, pageNum, isImage } = pageResult;
   const { endpoint, model, provider } = getFullEndpoint(aiConfig);
   const apiKey = aiConfig.apiKey!;
 
@@ -119,7 +225,9 @@ Rules:
 - Maximum 30 terms per page
 - If a term is unrecognizable/ambiguous, skip it`;
 
-  console.log(`[PDF AI Extractor] Sending page ${pageNum}/${totalPages} to AI vision model (${provider}, ${model})`);
+  console.log(
+    `[PDF AI Extractor] Sending page ${pageNum}/${totalPages} to AI vision model (${provider}, ${model}, ${mediaType})`
+  );
 
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -130,6 +238,11 @@ Rules:
     if (provider === 'anthropic') {
       headers['x-api-key'] = apiKey;
       headers['anthropic-version'] = '2023-06-01';
+
+      // Anthropic: 使用 base64（不带 data: 前缀）
+      const rawBase64 = dataURL.split(',')[1] || '';
+      const anthropicMediaType = mediaType === 'image/svg+xml' ? 'image/png' : mediaType;
+      // 注意: Anthropic 不原生支持 image/svg+xml，降级为 image/png
 
       requestBody = {
         model: model,
@@ -142,8 +255,8 @@ Rules:
                 type: 'image',
                 source: {
                   type: 'base64',
-                  media_type: 'image/png',
-                  data: imageDataURL.split(',')[1], // Anthropic uses raw base64
+                  media_type: anthropicMediaType,
+                  data: rawBase64,
                 },
               },
               {
@@ -162,7 +275,7 @@ Rules:
         body: JSON.stringify(requestBody),
       });
     } else {
-      // OpenAI / DeepSeek 兼容格式
+      // OpenAI / DeepSeek 兼容格式（支持 image/svg+xml）
       headers['Authorization'] = `Bearer ${apiKey}`;
 
       requestBody = {
@@ -176,7 +289,7 @@ Rules:
               {
                 type: 'image_url',
                 image_url: {
-                  url: imageDataURL,
+                  url: dataURL,
                   detail: 'high',
                 },
               },
@@ -198,7 +311,9 @@ Rules:
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(`[PDF AI Extractor] API error for page ${pageNum}: HTTP ${response.status}, ${errorText.substring(0, 200)}`);
+      console.error(
+        `[PDF AI Extractor] API error for page ${pageNum}: HTTP ${response.status}, ${errorText.substring(0, 200)}`
+      );
       throw new Error(`AI vision API error: HTTP ${response.status}`);
     }
 
@@ -218,7 +333,6 @@ Rules:
 
     console.log(`[PDF AI Extractor] Page ${pageNum}: AI response length ${aiText.length}`);
 
-    // 解析 AI 返回的 JSON
     const parsed = APIResponseHandler.parseJsonResponse(aiText);
     if (!Array.isArray(parsed)) {
       console.warn(`[PDF AI Extractor] Page ${pageNum}: AI response is not a valid JSON array`);
@@ -252,150 +366,6 @@ Rules:
     console.error(`[PDF AI Extractor] Extraction error for page ${pageNum}:`, error);
     throw error;
   }
-}
-
-/**
- * 通过 AI Vision 模式从 PDF 文件中抽取术语
- *
- * @param filePath PDF 文件路径
- * @param language 源语言
- * @param aiConfig AI 配置
- * @param onProgress 进度回调
- * @param maxPages 最大处理页数（默认 50，防止超长文档处理过久）
- * @returns 结构化术语数组
- */
-export async function extractTermsFromPDFViaAI(
-  filePath: string,
-  language: 'en' | 'zh' | 'auto' = 'auto',
-  aiConfig: AIConfig,
-  onProgress?: AIExtractionProgressCallback,
-  maxPages: number = 50
-): Promise<ExtractedTerm[]> {
-  if (!aiConfig.apiKey) {
-    throw new Error('AI API Key 未配置，无法使用 AI Vision PDF 抽取');
-  }
-
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`PDF 文件不存在: ${filePath}`);
-  }
-
-  console.log(`[PDF AI Extractor] Starting AI vision extraction for: ${filePath}`);
-
-  const pdfData = fs.readFileSync(filePath);
-  const uint8data = new Uint8Array(pdfData);
-
-  // 获取 PDF 总页数
-  const { createRequire } = await import('module');
-  const nodeRequire = createRequire(import.meta.url || __filename);
-  const pdfjsLib: any = nodeRequire('pdfjs-dist/legacy/build/pdf.js');
-  const loadingTask = pdfjsLib.getDocument({ data: uint8data });
-  const pdf = await loadingTask.promise;
-  const totalPages = Math.min(pdf.numPages, maxPages);
-
-  console.log(`[PDF AI Extractor] PDF has ${pdf.numPages} pages, processing up to ${totalPages}`);
-
-  if (totalPages === 0) {
-    throw new Error('PDF 文件没有可处理的页面');
-  }
-
-  const allTerms: ExtractedTerm[] = [];
-  const seenTerms = new Set<string>();
-
-  // 逐页处理
-  for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-    onProgress?.({
-      currentPage: pageNum,
-      totalPages,
-      stage: 'rendering',
-      message: `正在渲染第 ${pageNum}/${totalPages} 页...`,
-    });
-
-    let imageDataURL: string;
-
-    try {
-      // 渲染页面为图像
-      const { buffer, width, height } = await renderPDFPageAsImage(uint8data, pageNum);
-      console.log(`[PDF AI Extractor] Page ${pageNum}: rendered ${width}x${height}, buffer ${buffer.length} bytes`);
-
-      // 检查是否使用了降级模式（返回文本而非图像）
-      const isTextOnly = buffer[0] !== 0x89; // PNG magic number check
-      if (isTextOnly) {
-        // 降级模式：提取到的是文本，直接使用
-        const textContent = buffer.toString('utf-8');
-        console.log(`[PDF AI Extractor] Page ${pageNum}: using text-only extraction (${textContent.length} chars)`);
-
-        if (textContent.trim().length > 10) {
-          // 发送文本到 AI 进行术语提取
-          const terms = await extractTermsFromTextViaAI(textContent, language, aiConfig, pageNum);
-          for (const term of terms) {
-            const key = `${term.term_text}:${term.source_lang}`;
-            if (!seenTerms.has(key)) {
-              seenTerms.add(key);
-              allTerms.push(term);
-            }
-          }
-        }
-        onProgress?.({
-          currentPage: pageNum,
-          totalPages,
-          stage: 'complete',
-          message: `第 ${pageNum}/${totalPages} 页完成（文本模式）`,
-        });
-        continue;
-      }
-
-      // 正常图像模式
-      imageDataURL = bufferToDataURL(buffer);
-
-      onProgress?.({
-        currentPage: pageNum,
-        totalPages,
-        stage: 'extracting',
-        message: `正在 AI 提取第 ${pageNum}/${totalPages} 页...`,
-      });
-
-      const terms = await extractTermsFromPageImageViaAI(
-        imageDataURL,
-        pageNum,
-        totalPages,
-        language,
-        aiConfig
-      );
-
-      for (const term of terms) {
-        const key = `${term.term_text}:${term.source_lang}`;
-        if (!seenTerms.has(key)) {
-          seenTerms.add(key);
-          allTerms.push(term);
-        }
-      }
-
-      onProgress?.({
-        currentPage: pageNum,
-        totalPages,
-        stage: 'complete',
-        message: `第 ${pageNum}/${totalPages} 页完成（含 ${terms.length} 个术语）`,
-      });
-    } catch (pageError) {
-      console.error(`[PDF AI Extractor] Error processing page ${pageNum}:`, pageError);
-      onProgress?.({
-        currentPage: pageNum,
-        totalPages,
-        stage: 'error',
-        message: `第 ${pageNum}/${totalPages} 页处理失败: ${pageError instanceof Error ? pageError.message : String(pageError)}`,
-      });
-      // 继续处理下一页
-      continue;
-    }
-  }
-
-  // 按分数排序并去重
-  const result = allTerms
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 500);
-
-  console.log(`[PDF AI Extractor] Completed: ${result.length} unique terms from ${totalPages} pages`);
-  return result;
 }
 
 /**
@@ -464,4 +434,206 @@ ${text.substring(0, 3000)}`;
     console.error(`[PDF AI Extractor] Text extraction error for page ${context}:`, error);
     return [];
   }
+}
+
+/**
+ * 通过 AI Vision 模式从 PDF 文件中抽取术语
+ *
+ * 支持 3 种渲染路径：
+ *   1. Canvas → PNG → AI Vision（最佳，需要 node-canvas 原生模块）
+ *   2. SVG → SVG Data URL → AI Vision（降级，零原生依赖，pdfjs-dist 内置）
+ *   3. 纯文本 → AI 文本提取（fallback，适用于有文本层的 PDF）
+ *
+ * @param filePath PDF 文件路径
+ * @param language 源语言
+ * @param aiConfig AI 配置
+ * @param onProgress 进度回调
+ * @param maxPages 最大处理页数（默认 50，防止超长文档处理过久）
+ * @returns 结构化术语数组
+ */
+export async function extractTermsFromPDFViaAI(
+  filePath: string,
+  language: 'en' | 'zh' | 'auto' = 'auto',
+  aiConfig: AIConfig,
+  onProgress?: AIExtractionProgressCallback,
+  maxPages: number = 50
+): Promise<ExtractedTerm[]> {
+  if (!aiConfig.apiKey) {
+    throw new Error('AI API Key 未配置，无法使用 AI Vision PDF 抽取');
+  }
+
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`PDF 文件不存在: ${filePath}`);
+  }
+
+  console.log(`[PDF AI Extractor] Starting AI vision extraction for: ${filePath}`);
+
+  // 诊断 canvas 可用性
+  const canvasDiag = getCanvasDiagnostics();
+  if (canvasDiag.available) {
+    console.log('[PDF AI Extractor] ✅ Canvas 可用，将使用 PNG 渲染');
+  } else {
+    console.warn(
+      `[PDF AI Extractor] ⚠️  Canvas 不可用: ${canvasDiag.error}\n` +
+      `   将使用 SVG 渲染路径（零原生依赖）处理图片型 PDF。`
+    );
+  }
+
+  const pdfData = fs.readFileSync(filePath);
+  const uint8data = new Uint8Array(pdfData);
+
+  const pdf = await getDocumentSafe({
+    data: uint8data,
+    standardFontDataUrl: PDFJS_STANDARD_FONTS_URL,
+  });
+  const totalPages = Math.min(pdf.numPages, maxPages);
+
+  console.log(`[PDF AI Extractor] PDF has ${pdf.numPages} pages, processing up to ${totalPages}`);
+
+  if (totalPages === 0) {
+    throw new Error('PDF 文件没有可处理的页面');
+  }
+
+  const allTerms: ExtractedTerm[] = [];
+  const seenTerms = new Set<string>();
+  let skippedCount = 0;
+  let svgRenderedCount = 0;
+  let pngRenderedCount = 0;
+  let textOnlyCount = 0;
+
+  // 逐页处理
+  for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+    onProgress?.({
+      currentPage: pageNum,
+      totalPages,
+      stage: 'rendering',
+      message: `正在渲染第 ${pageNum}/${totalPages} 页...`,
+    });
+
+    try {
+      const pageResult = await renderPDFPage(uint8data, pageNum);
+
+      if (pageResult.isImage) {
+        // ── 图像模式（PNG 或 SVG）──
+        if (pageResult.mediaType === 'image/svg+xml') {
+          svgRenderedCount++;
+        } else {
+          pngRenderedCount++;
+        }
+
+        onProgress?.({
+          currentPage: pageNum,
+          totalPages,
+          stage: 'extracting',
+          message: `正在 AI 提取第 ${pageNum}/${totalPages} 页（${pageResult.mediaType === 'image/svg+xml' ? 'SVG' : 'PNG'} 模式）...`,
+        });
+
+        const terms = await extractTermsFromPageImageViaAI(
+          pageResult,
+          totalPages,
+          language,
+          aiConfig
+        );
+
+        for (const term of terms) {
+          const key = `${term.term_text}:${term.source_lang}`;
+          if (!seenTerms.has(key)) {
+            seenTerms.add(key);
+            allTerms.push(term);
+          }
+        }
+
+        onProgress?.({
+          currentPage: pageNum,
+          totalPages,
+          stage: 'complete',
+          message: `第 ${pageNum}/${totalPages} 页完成（${pageResult.mediaType === 'image/svg+xml' ? 'SVG' : 'PNG'} 视觉模式，${terms.length} 术语）`,
+        });
+      } else {
+        // ── 纯文本模式 ──
+        const text = pageResult.textContent;
+        textOnlyCount++;
+
+        if (text.length >= 10) {
+          console.log(`[PDF AI Extractor] Page ${pageNum}: 纯文本模式 (${text.length} chars)`);
+          const terms = await extractTermsFromTextViaAI(text, language, aiConfig, pageNum);
+          for (const term of terms) {
+            const key = `${term.term_text}:${term.source_lang}`;
+            if (!seenTerms.has(key)) {
+              seenTerms.add(key);
+              allTerms.push(term);
+            }
+          }
+          onProgress?.({
+            currentPage: pageNum,
+            totalPages,
+            stage: 'complete',
+            message: `第 ${pageNum}/${totalPages} 页完成（文本模式，${terms.length} 术语）`,
+          });
+        } else if (text.length === 0) {
+          skippedCount++;
+          console.warn(
+            `[PDF AI Extractor] ⚠️  第 ${pageNum}/${totalPages} 页跳过: 无可提取文本且无法渲染图像\n` +
+            `   请确认:\n` +
+            `   1. Node.js 版本兼容 (推荐 v20 LTS)\n` +
+            `   2. 已安装 canvas: npm install canvas\n` +
+            `   3. 已为 Electron 重新编译: npx electron-rebuild -f -w canvas`
+          );
+          onProgress?.({
+            currentPage: pageNum,
+            totalPages,
+            stage: 'error',
+            message: `第 ${pageNum}/${totalPages} 页跳过: 无法渲染且无文本层`,
+          });
+        } else {
+          console.warn(
+            `[PDF AI Extractor] ⚠️  第 ${pageNum}/${totalPages} 页跳过: 文本过短 (${text.length} chars)`
+          );
+          onProgress?.({
+            currentPage: pageNum,
+            totalPages,
+            stage: 'complete',
+            message: `第 ${pageNum}/${totalPages} 页完成（文本过短，跳过）`,
+          });
+        }
+      }
+    } catch (pageError) {
+      console.error(`[PDF AI Extractor] Error processing page ${pageNum}:`, pageError);
+      onProgress?.({
+        currentPage: pageNum,
+        totalPages,
+        stage: 'error',
+        message: `第 ${pageNum}/${totalPages} 页处理失败: ${
+          pageError instanceof Error ? pageError.message : String(pageError)
+        }`,
+      });
+      continue;
+    }
+  }
+
+  // 汇总日志
+  console.log(
+    `[PDF AI Extractor] 渲染统计: ${pngRenderedCount} PNG + ${svgRenderedCount} SVG + ${textOnlyCount} 纯文本 + ${skippedCount} 跳过`
+  );
+
+  if (skippedCount === totalPages && allTerms.length === 0) {
+    console.warn(
+      `[PDF AI Extractor] ⚠️  PDF 全部 ${totalPages} 页无法处理。\n` +
+      `   可能原因:\n` +
+      `   1. PDF 为纯图片扫描版，且 SVG 渲染也失败\n` +
+      `   2. 无 AI Vision API Key 或配置错误\n` +
+      `   建议:\n` +
+      `   - 安装 Canvas 原生模块: npm install canvas\n` +
+      `   - 为 Electron 重新编译: npx electron-rebuild -f -w canvas\n` +
+      `   - 确保 AI API Key 配置了支持 Vision 的模型（如 GPT-4o、Claude 3.5）`
+    );
+  }
+
+  // 按分数排序并去重
+  const result = allTerms.sort((a, b) => b.score - a.score).slice(0, 500);
+
+  console.log(
+    `[PDF AI Extractor] Completed: ${result.length} unique terms from ${totalPages} pages`
+  );
+  return result;
 }

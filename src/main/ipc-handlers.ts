@@ -16,7 +16,9 @@ import {
   batchUpdateTermDomains,
   addTermRelation,
   getTermRelations,
+  getTermRelationById,
   deleteTermRelation,
+  deleteTermRelationByPair,
   addTermSource,
   getTermSources,
   getExtractionJobs,
@@ -45,10 +47,10 @@ import {
   getOrCreateDomainPath,
   findDomainIdByName
 } from './database';
-import { extractTermsFromFile, extractTermsFromText, extractTermsFromUrl, extractTermsFromPDFWithAI, smartExtractTerms, smartExtractTermsFromFile, smartExtractTermsFromUrl } from './term-engine';
+import { extractTermsFromFile, extractTermsFromTextWithMeta, extractTermsFromUrlWithMeta, ExtractionMetadata, extractTermsFromPDFWithAI, smartExtractTerms, smartExtractTermsFromFile, smartExtractTermsFromUrl } from './term-engine';
 import { checkConsistency } from './consistency-checker';
-import { DEFAULT_STRATEGY } from './term-engine/smart-extractor';
-import { getAIConfigFromSettings, validateAIConfig, testAIConnection } from './ai-client';
+import { DEFAULT_STRATEGY, ExtractionStrategy } from './term-engine/smart-extractor';
+import { getAIConfigFromSettings, validateAIConfig, testAIConnection, AI_PROVIDERS } from './ai-client';
 import { detectLanguage, translateWithAI, alignTerms, batchTranslateTerms } from './ai-language-detection';
 import { createWebExtractionProgressReporter, ProgressStages, ProgressMessages, defaultProgressEstimator } from './progress-reporter';
 export function registerIPCHandlers() {
@@ -204,26 +206,54 @@ export function registerIPCHandlers() {
     ]);
   };
 
+  // 将前端传来的 aiConfig 转换为 ExtractionStrategy
+  const buildAIStrategy = (aiConfig: any): ExtractionStrategy => ({
+    ...DEFAULT_STRATEGY,
+    mode: 'ai-only',
+    aiConfig,
+  });
+
   // Extraction handlers
   ipcMain.handle('extract-terms-from-text', async (_, { text, language, useAI, aiConfig }) => {
     try {
       console.log(`[Extraction] Input text length: ${text?.length || 0}, language: ${language}, useAI: ${useAI}`);
-      // 启用AI时超时5分钟，非AI时超时2分钟
       const timeoutMs = useAI ? 300000 : 120000;
-      const data = await withTimeout(
-        extractTermsFromText(text, language, !!useAI, aiConfig),
+
+      if (useAI) {
+        // AI增强模式：使用smart-extractor，将原始文本直接提交给AI进行清洗+抽取
+        const strategy = buildAIStrategy(aiConfig);
+        const data = await withTimeout(
+          smartExtractTerms(text, language || 'auto', strategy),
+          timeoutMs,
+          `AI文本抽取处理超时（${timeoutMs / 1000}秒），请减少文本量或检查AI服务状态`
+        );
+        console.log(`[Extraction] AI mode extracted ${data.length} terms via smart-extractor`);
+        if (data.length === 0) {
+          return {
+            success: true,
+            data: [],
+            warning: 'AI增强抽取未能识别出术语（可能AI服务异常或文本内容不适合术语抽取）。',
+            metadata: { mode: 'ai-only', fallbackReason: 'AI返回空结果' },
+          };
+        }
+        return { success: true, data, metadata: { mode: 'ai-only' } };
+      }
+
+      // 规则模式：使用旧版管道
+      const { terms: data, metadata } = await withTimeout<{ terms: any[]; metadata: ExtractionMetadata }>(
+        extractTermsFromTextWithMeta(text, language, false, aiConfig),
         timeoutMs,
         `文本抽取处理超时（${timeoutMs / 1000}秒），请减少文本量或检查AI服务状态`
       );
-      console.log(`[Extraction] Extracted ${data.length} terms`);
+      console.log(`[Extraction] Extracted ${data.length} terms, mode: ${metadata.mode}`);
       if (data.length === 0) {
         console.warn('[Extraction] No terms extracted - returning empty array');
-        const warning = useAI
-          ? 'AI增强抽取未能识别出术语（可能AI服务异常或文本内容不适合术语抽取），已降级使用规则模式但未提取到有效术语。'
+        const warning = metadata.fallbackReason
+          ? `未从文本中提取到术语（${metadata.fallbackReason}），请检查输入文本是否包含有效的术语内容。`
           : '未从文本中提取到术语，请检查输入文本是否包含有效的术语内容。';
-        return { success: true, data, warning };
+        return { success: true, data, warning, metadata };
       }
-      return { success: true, data };
+      return { success: true, data, metadata };
     } catch (error) {
       console.error('[Extraction] Error:', error);
       return { success: false, error: (error as Error).message };
@@ -232,10 +262,31 @@ export function registerIPCHandlers() {
 
   ipcMain.handle('extract-terms-from-file', async (_, { filePath, language, useAI, aiConfig, sourceType }) => {
     try {
-      // 启用AI时超时5分钟，非AI时超时2分钟
       const timeoutMs = useAI ? 300000 : 120000;
+
+      if (useAI) {
+        // AI增强模式：使用smart-extractor，直接将文件提交给AI进行清洗+抽取
+        const strategy = buildAIStrategy(aiConfig);
+        const data = await withTimeout(
+          smartExtractTermsFromFile(filePath, language || 'auto', strategy),
+          timeoutMs,
+          `AI文件抽取处理超时（${timeoutMs / 1000}秒），请减少文件大小或检查AI服务状态`
+        );
+        console.log(`[Extraction File] AI mode extracted ${data.length} terms via smart-extractor`);
+        if (data.length === 0) {
+          return {
+            success: true,
+            data: [],
+            warning: 'AI增强抽取未能识别出术语（可能AI服务异常或文件内容不适合术语抽取）。',
+            metadata: { mode: 'ai-only', fallbackReason: 'AI返回空结果' },
+          };
+        }
+        return { success: true, data, metadata: { mode: 'ai-only' } };
+      }
+
+      // 规则模式：使用旧版管道
       const data = await withTimeout(
-        extractTermsFromFile(filePath, language, !!useAI, aiConfig, sourceType),
+        extractTermsFromFile(filePath, language, false, aiConfig, sourceType),
         timeoutMs,
         `文件抽取处理超时（${timeoutMs / 1000}秒），请减少文件大小或检查AI服务状态`
       );
@@ -274,30 +325,59 @@ export function registerIPCHandlers() {
         ProgressMessages.fetching(url)
       );
       
-      // 启用AI时超时5分钟，非AI时超时2分钟
       const timeoutMs = useAI ? 300000 : 120000;
-      const data = await withTimeout(
-        // 直接调用支持进度报告的extractTermsFromUrl函数
-        extractTermsFromUrl(url, language, !!useAI, aiConfig, progressReporter),
+
+      if (useAI) {
+        // AI增强模式：使用smart-extractor，直接将网页原始HTML提交给AI进行清洗+抽取
+        const strategy = buildAIStrategy(aiConfig);
+        const data = await withTimeout(
+          smartExtractTermsFromUrl(url, language || 'auto', strategy),
+          timeoutMs,
+          `AI URL抽取处理超时（${timeoutMs / 1000}秒），请确认URL可访问并检查AI服务状态`
+        );
+        console.log(`[Extraction URL] AI mode extracted ${data.length} terms via smart-extractor`);
+        progressReporter.complete(
+          ProgressMessages.complete(data.length),
+          { termCount: data.length }
+        );
+        if (data.length === 0) {
+          return {
+            success: true,
+            data: [],
+            warning: 'AI增强抽取未能识别出术语（可能AI服务异常或网页内容不适合术语抽取）。',
+            metadata: { mode: 'ai-only', fallbackReason: 'AI返回空结果' },
+          };
+        }
+        return { success: true, data, metadata: { mode: 'ai-only' } };
+      }
+
+      // 规则模式：使用旧版管道
+      const { terms: data, metadata } = await withTimeout(
+        extractTermsFromUrlWithMeta(url, language, false, aiConfig, progressReporter),
         timeoutMs,
         `URL抽取处理超时（${timeoutMs / 1000}秒），请确认URL可访问并检查AI服务状态`
       );
-      
+      console.log(`[Extraction URL] Extracted ${data.length} terms, mode: ${metadata.mode}${metadata.fallbackReason ? ', fallbackReason: ' + metadata.fallbackReason : ''}`);
+
       // 完成阶段
       progressReporter.complete(
         ProgressMessages.complete(data.length),
         { termCount: data.length }
       );
       
-      // 如果启用AI但结果为空，返回警告信息
+      // 如果启用AI但结果为空或降级，返回警告信息
       if (data.length === 0) {
-        const warning = useAI
-          ? 'AI增强抽取未能识别出术语（可能AI服务异常或网页内容不适合术语抽取），已降级使用规则模式但未提取到有效术语。'
+        const warning = metadata.fallbackReason
+          ? `规则模式后仍未提取到有效术语（${metadata.fallbackReason}）。`
           : '未从该URL中提取到术语，请检查网页内容是否包含有效的术语文本。';
-        return { success: true, data, warning };
+        return { success: true, data, warning, metadata };
+      }
+      if (metadata.fallbackReason) {
+        const warning = `抽取已降级（原因：${metadata.fallbackReason}）。结果可能质量较低。`;
+        return { success: true, data, warning, metadata };
       }
       
-      return { success: true, data };
+      return { success: true, data, metadata };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       progressReporter.error(errorMessage);
@@ -384,7 +464,7 @@ export function registerIPCHandlers() {
 
   ipcMain.handle('set-ai-config', (_, config) => {
     try {
-      console.log('Setting AI config:', config);
+      console.log('Setting AI config, fields:', Object.keys(config || {}).join(', '));
       
       // 验证配置
       const validation = validateAIConfig(config);
@@ -399,6 +479,7 @@ export function registerIPCHandlers() {
       if (config.apiKey) settingsToSave['apiKey'] = config.apiKey;
       if (config.endpoint) settingsToSave['endpoint'] = config.endpoint;
       if (config.model) settingsToSave['model'] = config.model;
+      if (config.provider) settingsToSave['provider'] = config.provider;
       if (config.promptTemplate) settingsToSave['promptTemplate'] = config.promptTemplate;
       if (config.dataPath) settingsToSave['dataPath'] = config.dataPath;
       
@@ -406,6 +487,7 @@ export function registerIPCHandlers() {
       if (config.apiKey) settingsToSave['ai_api_key'] = config.apiKey;
       if (config.endpoint) settingsToSave['ai_endpoint'] = config.endpoint;
       if (config.model) settingsToSave['ai_model'] = config.model;
+      if (config.provider) settingsToSave['ai_provider'] = config.provider;
       if (config.promptTemplate) settingsToSave['ai_prompt_template'] = config.promptTemplate;
       if (config.dataPath) settingsToSave['data_path'] = config.dataPath;
       
@@ -432,6 +514,11 @@ export function registerIPCHandlers() {
       console.error('Failed to set AI config:', error);
       return { success: false, error: (error as Error).message };
     }
+  });
+
+  // AI提供商配置获取处理器（返回支持的AI平台列表供前端使用）
+  ipcMain.handle('get-ai-providers', () => {
+    return { success: true, data: AI_PROVIDERS };
   });
 
   // AI连接测试处理器

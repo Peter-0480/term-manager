@@ -38,6 +38,8 @@ declare global {
       getDefaultExtractionStrategy(): Promise<any>;
       // AI配置测试
       testAIConnection(config: any): Promise<any>;
+      // 获取支持的AI平台及其模型列表
+      getAIProviders(): Promise<{ success: boolean; data: Record<string, { name: string; endpoint: string; defaultModel: string; models: string[] }> }>;
       
       // 语言对管理
       getLanguagePairs(): Promise<any>;
@@ -175,5 +177,8 @@ export const ipcApi = {
   // 监听抽取进度事件
   onExtractionProgress: (callback: (progress: any) => void) =>
     window.termManager.onExtractionProgress(callback),
-  
+
+  // 获取支持的AI平台及其模型列表
+  getAIProviders: () => window.termManager.getAIProviders(),
+
 };

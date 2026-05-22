@@ -27,7 +27,7 @@ import {
 import { ipcApi } from '../ipc-api';
 import TranslationEditor from './TranslationEditor';
 import type { TranslationEntry } from './TranslationEditor';
-import { getLanguageSelectOptions, getDefaultTargetLang, LANGUAGE_INFO, LANGUAGE_EMOJI } from '../utils/language-utils';
+import { getLanguageSelectOptions, getTargetLanguageSelectOptions } from '../utils/language-utils';
 
 const { Text } = Typography;
 const { TabPane } = Tabs;
@@ -122,6 +122,30 @@ export default function TermDetail({ term, visible, onClose, onUpdate }: TermDet
   const [translations, setTranslations] = useState<Translation[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('info');
+  const [targetTextKey, setTargetTextKey] = useState(0); // 用于强制刷新 target_text 输入框
+
+  /**
+   * 将 translations 数组中对应目标语言的译文同步到基本信息表单
+   */
+  const syncTargetText = (targetLang: string | undefined) => {
+    if (!targetLang) {
+      form.setFieldsValue({ target_text: '' });
+      return;
+    }
+    const trans = translations.find(t => t.language_code === targetLang);
+    form.setFieldsValue({ target_text: trans?.text || '' });
+    setTargetTextKey(prev => prev + 1);
+  };
+
+  // 当 translations 数据加载完成后，同步当前目标语言的译文到表单
+  useEffect(() => {
+    if (translations.length > 0) {
+      const targetLang = form.getFieldValue('target_lang');
+      if (targetLang) {
+        syncTargetText(targetLang);
+      }
+    }
+  }, [translations]);
 
   useEffect(() => {
     if (term && visible) {
@@ -169,7 +193,7 @@ export default function TermDetail({ term, visible, onClose, onUpdate }: TermDet
     try {
       const res = await ipcApi.getTerms({ page: 1, pageSize: 1000 });
       if (res.success) {
-        setTerms(res.rows || []);
+        setTerms(res.data || []);
       }
     } catch (error) {
       console.error('加载术语列表失败:', error);
@@ -193,7 +217,32 @@ export default function TermDetail({ term, visible, onClose, onUpdate }: TermDet
     try {
       const res = await ipcApi.updateTerm(term.id, values);
       if (res.success) {
+        // 同步目标语言译文到 translations 数组
+        const targetLang = values.target_lang;
+        const targetText = values.target_text;
+        if (targetLang) {
+          const existing = translations.find(t => t.language_code === targetLang);
+          if (existing?.id && targetText !== undefined) {
+            // 更新已有译文
+            await ipcApi.updateTranslation(existing.id, {
+              text: targetText,
+              confidence: existing.confidence || 1.0,
+            });
+          } else if (!existing && targetText && targetText.trim()) {
+            // 添加新译文
+            await ipcApi.addTranslation({
+              term_id: term.id,
+              language_code: targetLang,
+              text: targetText.trim(),
+              confidence: 1.0,
+              source: 'manual',
+            });
+          }
+          // 如果 targetText 为空且已有译文存在，可以考虑删除（或留空）- 此处保持现有译文不变
+        }
+
         message.success('术语更新成功');
+        loadTermData(); // 重新加载以刷新 translations 状态
         onUpdate();
       } else {
         message.error(res.error || '更新失败');
@@ -419,10 +468,13 @@ export default function TermDetail({ term, visible, onClose, onUpdate }: TermDet
           >
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
               <Form.Item name="source_lang" label="源语言" rules={[{ required: true }]}>
-                <Select options={[
-                  { label: '中文', value: 'zh' },
-                  { label: '英文', value: 'en' }
-                ]} />
+                <Select
+                  showSearch
+                  options={getLanguageSelectOptions()}
+                  filterOption={(input, option) =>
+                    (option?.label as string)?.toLowerCase().includes(input.toLowerCase())
+                  }
+                />
               </Form.Item>
               
               <Form.Item name="abbreviation" label="简称">
@@ -435,11 +487,26 @@ export default function TermDetail({ term, visible, onClose, onUpdate }: TermDet
             </Form.Item>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-              <Form.Item name="target_lang" label="目标语言">
-                <Select allowClear options={[
-                  { label: '中文', value: 'zh' },
-                  { label: '英文', value: 'en' }
-                ]} />
+              <Form.Item
+                noStyle
+                shouldUpdate={(prev, cur) => prev.source_lang !== cur.source_lang}
+              >
+                {({ getFieldValue }) => {
+                  const currentSourceLang = getFieldValue('source_lang') || term.source_lang;
+                  return (
+                    <Form.Item name="target_lang" label="目标语言">
+                      <Select
+                        allowClear
+                        showSearch
+                        options={getTargetLanguageSelectOptions(currentSourceLang)}
+                        filterOption={(input, option) =>
+                          (option?.label as string)?.toLowerCase().includes(input.toLowerCase())
+                        }
+                        onChange={(value) => syncTargetText(value)}
+                      />
+                    </Form.Item>
+                  );
+                }}
               </Form.Item>
               
               <Form.Item name="target_text" label="术语译文">
@@ -483,19 +550,22 @@ export default function TermDetail({ term, visible, onClose, onUpdate }: TermDet
                 name="related_term_id"
                 rules={[{ required: true, message: '请选择相关术语' }]}
               >
-                <Select
-                  placeholder="选择相关术语"
-                  style={{ width: 200 }}
-                  showSearch
-                  optionFilterProp="children"
-                  options={terms
-                    .filter(t => t.id !== term.id)
-                    .map(t => ({
-                      label: `${t.term_text} (${t.source_lang})`,
-                      value: t.id
-                    }))
-                  }
-                />
+              <Select
+                placeholder="选择相关术语"
+                style={{ width: 260 }}
+                showSearch
+                optionFilterProp="label"
+                filterOption={(input, option) =>
+                  (option?.label as string)?.toLowerCase().includes(input.toLowerCase())
+                }
+                options={terms
+                  .filter(t => t.id !== term.id)
+                  .map(t => ({
+                    label: `${t.term_text} (${t.source_lang})${t.target_text ? ` → ${t.target_text}` : ''}`,
+                    value: t.id
+                  }))
+                }
+              />
               </Form.Item>
               
               <Form.Item name="note">
