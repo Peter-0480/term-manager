@@ -4,7 +4,7 @@
 import fs from 'fs';
 import path from 'path';
 import type { Language, Translation, LanguagePair } from '../types/multilingual';
-import { AIConfig, getAIConfigFromSettings } from './ai-client';
+import { AIConfig, getAIConfigFromSettings, maskApiKey } from './ai-client';
 import { getAITermCompletionSuggestion, AICompletionRequest } from './ai-completion';
 import { BatchTranslationService, BatchTranslationRequest } from './batch-translation-service';
 import { APIResponseHandler } from './api-response-handler';
@@ -17,6 +17,8 @@ export interface Term {
   id: number;
   source_lang: string;
   term_text: string;
+  target_lang?: string;
+  target_text?: string;
   abbreviation?: string;
   domain_id?: number;
   description?: string;
@@ -638,7 +640,10 @@ class MemoryDatabase {
 
   setSettings(settingsObj: Record<string, any>): Record<string, string> {
     const now = new Date().toISOString();
-    console.log('Memory DB: Setting settings:', settingsObj);
+    const maskedSettings = Object.fromEntries(
+      Object.entries(settingsObj).map(([k, v]) => [k, (k === 'apiKey' || k === 'ai_api_key') ? maskApiKey(v as string) : v])
+    );
+    console.log('Memory DB: Setting settings:', maskedSettings);
     
     for (const [key, value] of Object.entries(settingsObj)) {
       if (value === undefined || value === null) continue;
@@ -647,14 +652,16 @@ class MemoryDatabase {
       if (existingIndex !== -1) {
         this.settings[existingIndex].value = String(value);
         this.settings[existingIndex].updated_at = now;
-        console.log(`Memory DB: Updated setting: ${key} = ${value}`);
+        const displayValue = (key === 'apiKey' || key === 'ai_api_key') ? maskApiKey(value) : value;
+        console.log(`Memory DB: Updated setting: ${key} = ${displayValue}`);
       } else {
         this.settings.push({
           key,
           value: String(value),
           updated_at: now
         });
-        console.log(`Memory DB: Added new setting: ${key} = ${value}`);
+        const displayValue2 = (key === 'apiKey' || key === 'ai_api_key') ? maskApiKey(value) : value;
+        console.log(`Memory DB: Added new setting: ${key} = ${displayValue2}`);
       }
     }
     
@@ -703,9 +710,12 @@ class MemoryDatabase {
     locked?: boolean;
     hasTranslation?: boolean;
     favorite?: boolean;
+    hasAbbreviation?: boolean | null;
     domains?: number[];
     sourceLangs?: string[];
     targetLangs?: string[];
+    translationLanguages?: string[];
+    translationStatus?: 'all' | 'has' | 'none';
     // 排序参数
     sortField?: string;
     sortOrder?: 'asc' | 'desc';
@@ -848,6 +858,75 @@ class MemoryDatabase {
       );
     }
     
+    // 简称筛选（hasAbbreviation: true=有简称, false=无简称, null/undefined=不筛）
+    if (params?.hasAbbreviation !== undefined && params.hasAbbreviation !== null) {
+      if (params.hasAbbreviation) {
+        filteredTerms = filteredTerms.filter(term => 
+          term.abbreviation && term.abbreviation.trim().length > 0
+        );
+      } else {
+        filteredTerms = filteredTerms.filter(term => 
+          !term.abbreviation || term.abbreviation.trim().length === 0
+        );
+      }
+    }
+    
+    // 译文语种筛选（多语种表头下拉筛）
+    if (params?.translationLanguages && params.translationLanguages.length > 0) {
+      filteredTerms = filteredTerms.filter(term => {
+        const translations = this.getTranslations(term.id);
+        return params.translationLanguages!.some(lang =>
+          translations.some(t => t.language_code === lang)
+        );
+      });
+    }
+    
+    // 译文状态筛选（all=全部, has=有译文, none=无译文）
+    // 当同时指定了语种筛选（translationLanguages）时，只针对指定语种判断译文状态
+    if (params?.translationStatus === 'has') {
+      filteredTerms = filteredTerms.filter(term => {
+        const translations = this.getTranslations(term.id);
+        // 如果有指定语种，只检查这些语种的翻译是否有效
+        if (params?.translationLanguages && params.translationLanguages.length > 0) {
+          return params.translationLanguages.some(lang => {
+            return translations.some(t =>
+              t.language_code === lang && t.language_code !== term.source_lang && t.text && t.text.trim().length > 0
+            ) ||
+            // 兼容旧数据：target_text 匹配指定语种
+            (term.target_lang === lang && term.target_lang !== term.source_lang && term.target_text && term.target_text.trim().length > 0);
+          });
+        }
+        // 无指定语种时，检查任意语种的有效翻译
+        const hasValidTranslation = translations.some(t => 
+          t.language_code !== term.source_lang && t.text && t.text.trim().length > 0
+        );
+        const hasLegacyTranslation = term.target_text && term.target_text.trim().length > 0
+          && term.target_lang && term.target_lang !== term.source_lang;
+        return hasValidTranslation || hasLegacyTranslation;
+      });
+    } else if (params?.translationStatus === 'none') {
+      filteredTerms = filteredTerms.filter(term => {
+        const translations = this.getTranslations(term.id);
+        // 如果有指定语种，只检查这些语种的翻译是否无效/缺失
+        if (params?.translationLanguages && params.translationLanguages.length > 0) {
+          return params.translationLanguages.every(lang => {
+            const hasValidForLang = translations.some(t =>
+              t.language_code === lang && t.language_code !== term.source_lang && t.text && t.text.trim().length > 0
+            );
+            const hasLegacyForLang = term.target_lang === lang && term.target_lang !== term.source_lang && term.target_text && term.target_text.trim().length > 0;
+            return !hasValidForLang && !hasLegacyForLang;
+          });
+        }
+        // 无指定语种时，检查任意语种都没有有效翻译
+        const hasValidTranslation = translations.some(t => 
+          t.language_code !== term.source_lang && t.text && t.text.trim().length > 0
+        );
+        const hasLegacyTranslation = term.target_text && term.target_text.trim().length > 0
+          && term.target_lang && term.target_lang !== term.source_lang;
+        return !hasValidTranslation && !hasLegacyTranslation;
+      });
+    }
+    
     // 关键词搜索
     if (params?.keyword) {
       const keyword = params.keyword.toLowerCase();
@@ -901,7 +980,10 @@ class MemoryDatabase {
     const offset = (page - 1) * pageSize;
     
     const total = filteredTerms.length;
-    const rows = filteredTerms.slice(offset, offset + pageSize);
+    const rows = filteredTerms.slice(offset, offset + pageSize).map(term => {
+      const translations = this.getTranslations(term.id);
+      return { ...term, translations };
+    });
     
     return { rows, total };
   }
@@ -962,55 +1044,90 @@ class MemoryDatabase {
     
     this.terms.push(newTerm);
     
-    // 如果调用方明确提供了 translations 数组，直接使用（优先）
+    // 收集调用方提供的译文（translations 数组或 target_lang+target_text）
+    const providedTranslations = new Map<string, { text: string; confidence?: number; source?: string }>();
+    
     if (term.translations && term.translations.length > 0) {
       for (const t of term.translations) {
-        // 跳过同语互译
         if (t.language_code === term.source_lang) {
           console.warn(`跳过同语互译: ${term.source_lang} -> ${t.language_code}`);
           continue;
         }
-        this.addTranslation({
-          term_id: newTerm.id,
-          language_code: t.language_code,
-          text: t.text,
+        providedTranslations.set(t.language_code, {
+          text: t.text || '',
           confidence: t.confidence,
           source: t.source || 'import'
         });
       }
-      console.log(`从 translations 数组导入了 ${term.translations.length} 条翻译记录`);
-      
-      // 将第一条有效译文回填到术语对象，确保术语列表和详情页能显示"术语译文"
-      const validTranslations = term.translations.filter(t => 
-        t.text && t.text.trim() !== '' && t.language_code !== term.source_lang
-      );
-      if (validTranslations.length > 0) {
-        (newTerm as any).target_text = validTranslations[0].text;
-        (newTerm as any).target_lang = validTranslations[0].language_code;
-        console.log(`回填术语译文: target_text="${validTranslations[0].text.substring(0, 30)}", target_lang=${validTranslations[0].language_code}`);
-      }
-    }
-    // 向后兼容：如果提供了target_lang和target_text，自动添加为翻译
-    else if (term.target_lang && term.target_text) {
-      // 标准化目标语言
+    } else if (term.target_lang && term.target_text) {
       const normalizedTargetLang = normalizeTargetLang(term.source_lang, term.target_lang);
-      // 检查是否源语言和目标语言相同（禁止同语互译）
       if (normalizedTargetLang === term.source_lang) {
         console.warn(`跳过同语互译（标准化后）：源语言和目标语言相同 (${term.source_lang} -> ${normalizedTargetLang})`);
-        // 即使跳过，仍然创建默认翻译配置
-        this.createDefaultTranslations(newTerm.id, term.source_lang);
       } else {
-        this.addTranslation({
-          term_id: newTerm.id,
-          language_code: normalizedTargetLang,
+        providedTranslations.set(normalizedTargetLang, {
           text: term.target_text,
           source: 'legacy'
         });
-        console.log(`使用用户提供的翻译（标准化后）: ${term.source_lang} -> ${normalizedTargetLang}`);
       }
+    }
+    
+    // 统一策略：先为所有需要的语种创建翻译槽位，再用提供的译文覆盖
+    // 支持的11种语言：中文（母语）+ 10种外文
+    const allForeignLanguages = ['en', 'fr', 'es', 'de', 'ja', 'ru', 'pt', 'it', 'ko', 'ar'];
+    const supportedLanguages = ['zh', ...allForeignLanguages];
+    
+    if (term.source_lang === 'zh') {
+      // 中文术语 → 为所有外文语种创建翻译槽位
+      // 英文字母顺序排列（en优先）
+      const orderedLanguages = ['en', ...allForeignLanguages.filter(lang => lang !== 'en').sort()];
+      
+      for (const lang of orderedLanguages) {
+        const provided = providedTranslations.get(lang);
+        this.addTranslation({
+          term_id: newTerm.id,
+          language_code: lang,
+          text: provided ? provided.text : '',  // 有提供译文则填入，否则留空
+          confidence: provided?.confidence,
+          source: provided ? (provided.source || 'import') : 'default'
+        });
+        if (provided && provided.text) {
+          console.log(`为中文术语(ID:${newTerm.id})创建翻译槽位（已有译文）: ${lang} = "${provided.text.substring(0, 30)}"`);
+        } else {
+          console.log(`为中文术语(ID:${newTerm.id})创建空翻译槽位: ${lang}`);
+        }
+      }
+      console.log(`中文术语(ID:${newTerm.id})翻译槽位创建完成：${orderedLanguages.length}个外文槽位`);
     } else {
-      // 智能默认翻译创建：根据源语言创建合适的翻译记录
-      this.createDefaultTranslations(newTerm.id, term.source_lang);
+      // 外文术语 → 仅创建中文翻译槽位
+      const targetLanguages = supportedLanguages.filter(lang => lang !== term.source_lang);
+      
+      for (const lang of targetLanguages) {
+        // 外文术语只翻译到中文，不创建其他外文翻译槽位
+        if (lang !== 'zh') continue;
+        const provided = providedTranslations.get(lang);
+        this.addTranslation({
+          term_id: newTerm.id,
+          language_code: lang,
+          text: provided ? provided.text : '',  // 有提供译文则填入，否则留空
+          confidence: provided?.confidence,
+          source: provided ? (provided.source || 'import') : 'default'
+        });
+        if (provided && provided.text) {
+          console.log(`为外文术语(ID:${newTerm.id})创建中文翻译槽位（已有译文）: zh = "${provided.text.substring(0, 30)}"`);
+        } else {
+          console.log(`为外文术语(ID:${newTerm.id})创建空中文翻译槽位`);
+        }
+      }
+      console.log(`外文术语(ID:${newTerm.id})翻译槽位创建完成`);
+    }
+    
+    // 回填 target_text / target_lang 到术语对象，确保列表显示"术语译文"
+    const allTranslations = this.getTranslations(newTerm.id);
+    const firstValid = allTranslations.find(t => t.text && t.text.trim() !== '');
+    if (firstValid) {
+      (newTerm as any).target_text = firstValid.text;
+      (newTerm as any).target_lang = firstValid.language_code;
+      console.log(`回填术语译文: target_text="${firstValid.text.substring(0, 30)}", target_lang=${firstValid.language_code}`);
     }
     
     // 保存数据到文件
@@ -1099,36 +1216,67 @@ class MemoryDatabase {
       return supportedLangs.includes(targetLang) ? targetLang : 'en';
     };
     
-    // 处理 translations 数组：如果提供了，替换该术语的所有翻译
+    // 处理 translations 数组：采用合并策略，仅更新/添加传入的翻译槽位，保留未传入的现有槽位
     if (updates.translations !== undefined) {
-      // 删除该术语的现有翻译
-      this.translations = this.translations.filter(t => t.term_id !== id);
+      // 获取该术语现有的所有翻译记录
+      const existingTranslations = this.translations.filter(t => t.term_id === id);
       
-      // 添加新的翻译
+      // 对传入的每条翻译进行合并：存在则更新，不存在则添加
       for (const t of updates.translations) {
         // 跳过同语互译
         if (t.language_code === term.source_lang) {
           console.warn(`跳过同语互译: ${term.source_lang} -> ${t.language_code}`);
           continue;
         }
-        this.addTranslation({
-          term_id: id,
-          language_code: t.language_code,
-          text: t.text,
-          confidence: t.confidence,
-          source: t.source || 'manual'
-        });
+        
+        // 查找该语种是否已有翻译记录
+        const existingIdx = existingTranslations.findIndex(
+          et => et.language_code === t.language_code
+        );
+        
+        if (existingIdx >= 0) {
+          // 已存在：更新该翻译记录
+          const et = existingTranslations[existingIdx];
+          et.text = t.text;
+          if (t.confidence !== undefined) et.confidence = t.confidence;
+          if (t.source) et.source = t.source;
+          console.log(`合并翻译槽位(ID:${id}, ${t.language_code}): 更新现有记录`);
+        } else {
+          // 不存在：添加新的翻译记录
+          this.addTranslation({
+            term_id: id,
+            language_code: t.language_code,
+            text: t.text,
+            confidence: t.confidence,
+            source: t.source || 'manual'
+          });
+          console.log(`合并翻译槽位(ID:${id}, ${t.language_code}): 添加新记录`);
+        }
       }
-      console.log(`更新术语ID:${id} 的翻译记录，共 ${updates.translations.length} 条`);
+      console.log(`合并更新术语ID:${id} 的翻译记录，传入 ${updates.translations.length} 条，现有保留 ${existingTranslations.length} 条槽位`);
       
-      // 将第一条有效译文回填到术语对象，确保术语列表和详情页能显示"术语译文"
-      const validTranslations = updates.translations.filter(t => 
+      // 回填术语译文到术语对象，确保术语列表能正确显示默认语种译文
+      // 修复：从术语所有翻译记录中按优先级选取，而非仅从本次传入的翻译中选择
+      const allTranslations = this.translations.filter(t => t.term_id === id);
+      const validAllTranslations = allTranslations.filter(t =>
         t.text && t.text.trim() !== '' && t.language_code !== term.source_lang
       );
-      if (validTranslations.length > 0) {
-        (term as any).target_text = validTranslations[0].text;
-        (term as any).target_lang = validTranslations[0].language_code;
-        console.log(`回填术语译文（更新）: target_text="${validTranslations[0].text.substring(0, 30)}", target_lang=${validTranslations[0].language_code}`);
+      if (validAllTranslations.length > 0) {
+        // 优先级：中文源术语→英文(en)，外文源术语→中文(zh)，否则按字母序选取第一个
+        let bestTranslation;
+        if (term.source_lang === 'zh') {
+          bestTranslation = validAllTranslations.find(t => t.language_code === 'en');
+        } else {
+          bestTranslation = validAllTranslations.find(t => t.language_code === 'zh');
+        }
+        if (!bestTranslation) {
+          bestTranslation = validAllTranslations.sort((a, b) => 
+            a.language_code.localeCompare(b.language_code)
+          )[0];
+        }
+        (term as any).target_text = bestTranslation.text;
+        (term as any).target_lang = bestTranslation.language_code;
+        console.log(`回填术语译文（更新）: target_text="${bestTranslation.text.substring(0, 30)}", target_lang=${bestTranslation.language_code}（从${validAllTranslations.length}条有效译文中按优先级选取）`);
       }
       
       // 从 updates 中移除 translations，避免被 Object.assign 合并到 term 对象
@@ -1156,6 +1304,36 @@ class MemoryDatabase {
     }
     
     Object.assign(term, updates);
+    
+    // 回填术语译文：若本次更新未显式传入 target_text（例如仅更新 translations 表或更新其他字段），
+    // 则从 translations 表中选取最佳译文回填到 term.target_lang / term.target_text，确保术语列表的术语译文列能正确呈现。
+    // 修复：当用户编辑非法语翻译后，legacy 字段不会被错误覆盖而导致其他语种显示"待翻译"。
+    if (updates.target_text === undefined) {
+      const allTranslations = this.translations.filter(t => t.term_id === id);
+      const validAllTranslations = allTranslations.filter(t =>
+        t.text && t.text.trim() !== '' && t.language_code !== term.source_lang
+      );
+      if (validAllTranslations.length > 0) {
+        let bestTranslation;
+        if (term.source_lang === 'zh') {
+          bestTranslation = validAllTranslations.find(t => t.language_code === 'en');
+        } else {
+          bestTranslation = validAllTranslations.find(t => t.language_code === 'zh');
+        }
+        if (!bestTranslation) {
+          bestTranslation = validAllTranslations.sort((a, b) =>
+            a.language_code.localeCompare(b.language_code)
+          )[0];
+        }
+        (term as any).target_text = bestTranslation.text;
+        (term as any).target_lang = bestTranslation.language_code;
+        console.log(`回填术语译文（非显式更新）: target_text="${bestTranslation.text.substring(0, 30)}", target_lang=${bestTranslation.language_code}`);
+      }
+    }
+    
+    // 保存数据到文件（确保翻译合并结果持久化）
+    this.saveDataToFile();
+    
     return { changes: 1 };
   }
 
@@ -1607,22 +1785,30 @@ class MemoryDatabase {
   }
 
   getTermRelations(termId: number) {
-    const relations = this.termRelations.filter(rel => rel.term_id === termId);
-    return relations.map(rel => {
-      const relatedTerm = this.terms.find(t => t.id === rel.related_term_id);
-      // 获取相关术语的翻译
-      const translations = this.getTranslations(rel.related_term_id);
-      // 查找第一个翻译作为示例
+    // 正向关系：本术语指向其它术语
+    const forwardRelations = this.termRelations.filter(rel => rel.term_id === termId);
+    // 反向关系：其它术语指向本术语（在对方术语详情里也要体现这种关联）
+    const reverseRelations = this.termRelations.filter(rel => rel.related_term_id === termId && rel.term_id !== termId);
+
+    const mapRelation = (rel: TermRelation, relatedTermId: number) => {
+      const relatedTerm = this.terms.find(t => t.id === relatedTermId);
+      const translations = this.getTranslations(relatedTermId);
       const firstTranslation = translations.length > 0 ? translations[0] : null;
       return {
         ...rel,
         term_text: relatedTerm?.term_text || '',
         source_lang: relatedTerm?.source_lang || '',
-        // 向后兼容：使用第一个翻译作为target_text
         target_text: firstTranslation?.text || '',
         target_lang: firstTranslation?.language_code || ''
       };
-    });
+    };
+
+    // 正向关系：related_term_id 是关联术语
+    const forward = forwardRelations.map(rel => mapRelation(rel, rel.related_term_id));
+    // 反向关系：term_id 是关联术语（即指向本术语的那个源术语）
+    const reverse = reverseRelations.map(rel => mapRelation(rel, rel.term_id));
+
+    return [...forward, ...reverse];
   }
 
   deleteTermRelation(id: number) {
@@ -1631,6 +1817,37 @@ class MemoryDatabase {
       this.termRelations.splice(index, 1);
     }
     return { changes: 1 };
+  }
+
+  getTermRelationById(id: number) {
+    return this.termRelations.find(rel => rel.id === id) || null;
+  }
+
+  deleteTermRelationByPair(term_id: number, relation_type: string, related_term_id: number) {
+    // 删除正向关系
+    const forwardIndex = this.termRelations.findIndex(
+      rel => rel.term_id === term_id && rel.relation_type === relation_type && rel.related_term_id === related_term_id
+    );
+    let changes = 0;
+    if (forwardIndex !== -1) {
+      this.termRelations.splice(forwardIndex, 1);
+      changes++;
+    }
+    // 同时删除反向关系（如果存在对应的逆向记录）
+    const reverseIndex = this.termRelations.findIndex(
+      rel => rel.term_id === related_term_id && rel.relation_type === relation_type && rel.related_term_id === term_id
+    );
+    if (reverseIndex !== -1) {
+      // 注意：splice 后索引可能变化，需重新查找
+      const adjustedIndex = this.termRelations.findIndex(
+        rel => rel.term_id === related_term_id && rel.relation_type === relation_type && rel.related_term_id === term_id
+      );
+      if (adjustedIndex !== -1) {
+        this.termRelations.splice(adjustedIndex, 1);
+        changes++;
+      }
+    }
+    return { changes };
   }
 
   // DAO: 术语来源操作
@@ -1731,6 +1948,28 @@ class MemoryDatabase {
     confidence?: number;
     source?: string;
   }) {
+    // 去重检查：同一术语的同一语种翻译槽位只能有一个
+    // 若已存在则合并更新（追加/覆盖译文），避免创建重复槽位
+    const existing = this.translations.find(
+      t => t.term_id === translation.term_id && t.language_code === translation.language_code
+    );
+    
+    if (existing) {
+      // 已存在：合并策略 —— 仅当新译文非空时覆盖，confidence和source也合并
+      if (translation.text && translation.text.trim() !== '') {
+        existing.text = translation.text;
+      }
+      if (translation.confidence !== undefined) {
+        existing.confidence = translation.confidence;
+      }
+      if (translation.source) {
+        existing.source = translation.source;
+      }
+      existing.updated_at = new Date().toISOString();
+      console.log(`翻译槽位去重合并(ID:${existing.id}, term:${translation.term_id}, ${translation.language_code}): 已存在，已合并更新`);
+      return existing.id;
+    }
+    
     const now = new Date().toISOString();
     const newTranslation: TranslationRecord = {
       id: this.getNextId('translations'),
@@ -2402,6 +2641,14 @@ export function getTermRelations(termId: number) {
 
 export function deleteTermRelation(id: number) {
   return getDatabase().deleteTermRelation(id);
+}
+
+export function getTermRelationById(id: number) {
+  return getDatabase().getTermRelationById(id);
+}
+
+export function deleteTermRelationByPair(term_id: number, relation_type: string, related_term_id: number) {
+  return getDatabase().deleteTermRelationByPair(term_id, relation_type, related_term_id);
 }
 
 export function addTermSource(source: any) {

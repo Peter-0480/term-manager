@@ -38,20 +38,37 @@ export function detectBilingualContent(text: string): {
   
   // 统计各语言字符比例
   const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
-  const latinChars = (text.match(/[a-zA-Z]/g) || []).length;
   const japaneseChars = (text.match(/[\u3040-\u309F\u30A0-\u30FF]/g) || []).length;
   const koreanChars = (text.match(/[\uAC00-\uD7AF]/g) || []).length;
   const cyrillicChars = (text.match(/[\u0400-\u04FF]/g) || []).length;
   
-  const languages: { lang: string; ratio: number }[] = [];
+  // [修复] 拉丁语系精细检测：区分英语 vs 法语/德语/西班牙语/意大利语/葡萄牙语
+  // 原逻辑将所有 [a-zA-Z] 字符都标记为 "en"，导致法语等被误判为英语
+  const allLatinChars = (text.match(/[a-zA-ZÀ-ÖØ-öø-ÿ]/g) || []).length;
   
+  // 各非英语拉丁语种特有字符统计
+  const frenchSpecialChars = (text.match(/[éàèùâêîôûëïüÿçæœÉÀÈÙÂÊÎÔÛËÏÜŸÇÆŒ]/g) || []).length;
+  const germanSpecialChars = (text.match(/[äöüßÄÖÜ]/g) || []).length;
+  const spanishSpecialChars = (text.match(/[ñáéíóúü¿¡ÑÁÉÍÓÚÜ]/g) || []).length;
+  const italianSpecialChars = (text.match(/[àèéìòùÀÈÉÌÒÙ]/g) || []).length;
+  const portugueseSpecialChars = (text.match(/[ãõâêôáéíóúçûüÃÕÂÊÔÁÉÍÓÚÇÛÜ]/g) || []).length;
+  
+  // 基础拉丁字母（a-z, A-Z，排除非英语特有字符）
+  const basicLatinChars = allLatinChars - frenchSpecialChars - germanSpecialChars - spanishSpecialChars - italianSpecialChars - portugueseSpecialChars;
+  
+  // 各语种总拉丁字符数（基础 + 特有）
+  const frenchTotal = basicLatinChars + frenchSpecialChars;
+  const germanTotal = basicLatinChars + germanSpecialChars;
+  const spanishTotal = basicLatinChars + spanishSpecialChars;
+  const italianTotal = basicLatinChars + italianSpecialChars;
+  const portugueseTotal = basicLatinChars + portugueseSpecialChars;
+  
+  const languages: { lang: string; ratio: number }[] = [];
   const minRatio = 0.05; // 至少5%才算显著
+  const minSpecialCharForLang = 2; // 至少2个特有字符才视为该语言显著（降低阈值以提高短段落法文等语种检出率）
   
   if (chineseChars / totalChars > minRatio) {
     languages.push({ lang: 'zh', ratio: chineseChars / totalChars });
-  }
-  if (latinChars / totalChars > minRatio) {
-    languages.push({ lang: 'en', ratio: latinChars / totalChars });
   }
   if (japaneseChars / totalChars > minRatio) {
     languages.push({ lang: 'ja', ratio: japaneseChars / totalChars });
@@ -61,6 +78,33 @@ export function detectBilingualContent(text: string): {
   }
   if (cyrillicChars / totalChars > minRatio) {
     languages.push({ lang: 'ru', ratio: cyrillicChars / totalChars });
+  }
+  
+  // [修复] 拉丁语系按特有字符比例判定语种
+  if (allLatinChars / totalChars > minRatio) {
+    const latinRatio = allLatinChars / totalChars;
+    
+    // 判断最可能的非英语拉丁语种
+    const candidates: { lang: string; special: number; totalRatio: number }[] = [
+      { lang: 'fr', special: frenchSpecialChars, totalRatio: frenchTotal / totalChars },
+      { lang: 'de', special: germanSpecialChars, totalRatio: germanTotal / totalChars },
+      { lang: 'es', special: spanishSpecialChars, totalRatio: spanishTotal / totalChars },
+      { lang: 'it', special: italianSpecialChars, totalRatio: italianTotal / totalChars },
+      { lang: 'pt', special: portugueseSpecialChars, totalRatio: portugueseTotal / totalChars },
+    ];
+    
+    // 按特有字符数从多到少排序
+    candidates.sort((a, b) => b.special - a.special);
+    const bestCandidate = candidates[0];
+    
+    if (bestCandidate.special >= minSpecialCharForLang) {
+      // 特有的非英语拉丁语种占主导
+      languages.push({ lang: bestCandidate.lang, ratio: Math.min(latinRatio, 1.0) });
+      console.log(`[Bilingual Detector] Detected non-English Latin: ${bestCandidate.lang} (${bestCandidate.special} special chars)`);
+    } else if (basicLatinChars / totalChars > minRatio) {
+      // 基础拉丁字符占主导，判定为英语
+      languages.push({ lang: 'en', ratio: basicLatinChars / totalChars });
+    }
   }
   
   // 如果包含两种或以上语言，则为双语
@@ -91,8 +135,14 @@ export function segmentByLanguage(text: string): BilingualSegment[] {
     
     // 检测段落语言
     const zhCount = (para.match(/[\u4e00-\u9fa5]/g) || []).length;
-    const enCount = (para.match(/[a-zA-Z]/g) || []).length;
-    const totalSignificant = zhCount + enCount;
+    const latinCount = (para.match(/[a-zA-Z]/g) || []).length;
+    // 法文及其他拉丁语种特有字符（带重音/变音符号的字母）
+    const frSpecificCount = (para.match(/[éèêëàâäùûüçôöîïÉÈÊËÀÂÄÙÛÜÇÔÖÎÏ]/g) || []).length;
+    // 德文特有：ß, ü, ö, ä (部分与法文重叠，但德文一般有 ß)
+    const deSpecificCount = (para.match(/[ß]/g) || []).length;
+    // 西班牙文特有：ñ, ¿, ¡
+    const esSpecificCount = (para.match(/[ñÑ¿¡]/g) || []).length;
+    const totalSignificant = zhCount + latinCount;
     
     if (totalSignificant === 0) {
       // 无法判断语言（如纯数字/符号），并入前一段
@@ -108,11 +158,23 @@ export function segmentByLanguage(text: string): BilingualSegment[] {
     if (zhCount / totalSignificant > 0.6) {
       lang = 'zh';
       confidence = Math.min(1, zhCount / totalSignificant);
-    } else if (enCount / totalSignificant > 0.6) {
-      lang = 'en';
-      confidence = Math.min(1, enCount / totalSignificant);
+    } else if (latinCount / totalSignificant > 0.6) {
+      // 拉丁字母段落，进一步区分语种
+      if (frSpecificCount >= 2) {
+        lang = 'fr';
+        confidence = Math.min(1, latinCount / totalSignificant);
+      } else if (deSpecificCount >= 2) {
+        lang = 'de';
+        confidence = Math.min(1, latinCount / totalSignificant);
+      } else if (esSpecificCount >= 2) {
+        lang = 'es';
+        confidence = Math.min(1, latinCount / totalSignificant);
+      } else {
+        lang = 'en';
+        confidence = Math.min(1, latinCount / totalSignificant);
+      }
     } else {
-      lang = zhCount > enCount ? 'zh' : 'en';
+      lang = zhCount > latinCount ? 'zh' : 'en';
       confidence = 0.5;
     }
     

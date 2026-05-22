@@ -50,9 +50,16 @@ export function getTerms(params?: {
   // 新增高级搜索参数
   locked?: boolean;
   hasTranslation?: boolean;
+  favorite?: boolean;
+  hasAbbreviation?: boolean | null;
   domains?: number[];
   sourceLangs?: string[];
   targetLangs?: string[];
+  translationLanguages?: string[];
+  translationStatus?: 'all' | 'has' | 'none';
+  // 排序参数
+  sortField?: string;
+  sortOrder?: 'asc' | 'desc';
 }) {
   return memoryDB.getTerms(params);
 }
@@ -143,8 +150,16 @@ export function getTermRelations(termId: number) {
   return memoryDB.getTermRelations(termId);
 }
 
+export function getTermRelationById(id: number) {
+  return memoryDB.getTermRelationById(id);
+}
+
 export function deleteTermRelation(id: number) {
   return memoryDB.deleteTermRelation(id);
+}
+
+export function deleteTermRelationByPair(term_id: number, relation_type: string, related_term_id: number) {
+  return memoryDB.deleteTermRelationByPair(term_id, relation_type, related_term_id);
 }
 
 // DAO: Term Sources

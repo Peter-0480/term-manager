@@ -528,7 +528,7 @@ export function addTermRelation(relation: {
   note?: string;
 }) {
   const stmt = db.prepare(`
-    INSERT INTO term_relations (term_id, relation_type, related_term_id, note, created_at)
+    INSERT OR IGNORE INTO term_relations (term_id, relation_type, related_term_id, note, created_at)
     VALUES (?, ?, ?, ?, ?)
   `);
   
@@ -544,20 +544,45 @@ export function addTermRelation(relation: {
 }
 
 export function getTermRelations(termId: number) {
+  // 联合查询：正向关系（本术语指向其它术语） + 反向关系（其它术语指向本术语）
   const stmt = db.prepare(`
-    SELECT tr.*, t.term_text, t.source_lang, t.target_text, t.target_lang
+    SELECT tr.*, t.term_text, t.source_lang, t.target_text, t.target_lang,
+           'forward' AS direction
     FROM term_relations tr
     JOIN terms t ON tr.related_term_id = t.id
     WHERE tr.term_id = ?
-    ORDER BY tr.created_at DESC
+    UNION ALL
+    SELECT tr.*, t.term_text, t.source_lang, t.target_text, t.target_lang,
+           'reverse' AS direction
+    FROM term_relations tr
+    JOIN terms t ON tr.term_id = t.id
+    WHERE tr.related_term_id = ? AND tr.term_id != ?
+    ORDER BY created_at DESC
   `);
-  
-  return stmt.all(termId);
+
+  return stmt.all(termId, termId, termId);
+}
+
+export function getTermRelationById(id: number) {
+  const stmt = db.prepare('SELECT * FROM term_relations WHERE id = ?');
+  return stmt.get(id);
 }
 
 export function deleteTermRelation(id: number) {
   const stmt = db.prepare('DELETE FROM term_relations WHERE id = ?');
   return stmt.run(id);
+}
+
+export function deleteTermRelationByPair(term_id: number, relation_type: string, related_term_id: number) {
+  // 删除正向关系
+  const forwardStmt = db.prepare('DELETE FROM term_relations WHERE term_id = ? AND relation_type = ? AND related_term_id = ?');
+  const forwardResult = forwardStmt.run(term_id, relation_type, related_term_id);
+  // 同时删除可能存在的反向关系
+  const reverseStmt = db.prepare('DELETE FROM term_relations WHERE term_id = ? AND relation_type = ? AND related_term_id = ?');
+  const reverseResult = reverseStmt.run(related_term_id, relation_type, term_id);
+  return {
+    changes: (forwardResult.changes || 0) + (reverseResult.changes || 0)
+  };
 }
 
 // DAO: 术语来源操作

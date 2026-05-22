@@ -1,116 +1,372 @@
 /**
- * Minimal polyfills for browser APIs required by pdfjs-dist 4.x
- * in Node.js / Electron main process environment.
- *
- * These are loaded BEFORE any other module to satisfy pdfjs-dist's
- * initialization requirements.
+ * PDF.js 4.x Polyfills - Electron 主进程的浏览器 API polyfills
+ * 必须在所有其他 import 之前加载！
  */
 
-// ---- DOMMatrix ----
-// pdfjs-dist uses DOMMatrix for coordinate transforms
-class DOMMatrixPolyfill {
-  m11 = 1; m12 = 0; m13 = 0; m14 = 0;
-  m21 = 0; m22 = 1; m23 = 0; m24 = 0;
-  m31 = 0; m32 = 0; m33 = 1; m34 = 0;
-  m41 = 0; m42 = 0; m43 = 0; m44 = 1;
+// ──────────────────────────────────────────
+// 1. Node.js Crypto (用于 PDF 签名/校验)
+// ──────────────────────────────────────────
+import * as crypto from 'crypto';
+import { pathToFileURL } from 'url';
 
-  get a() { return this.m11; } set a(v: number) { this.m11 = v; }
-  get b() { return this.m21; } set b(v: number) { this.m21 = v; }
-  get c() { return this.m12; } set c(v: number) { this.m12 = v; }
-  get d() { return this.m22; } set d(v: number) { this.m22 = v; }
-  get e() { return this.m41; } set e(v: number) { this.m41 = v; }
-  get f() { return this.m42; } set f(v: number) { this.m42 = v; }
-
-  constructor(init?: string | number[]) {
-    if (typeof init === 'string') {
-      // Parse CSS matrix() format: "matrix(a, b, c, d, e, f)"
-      const parts = init.replace(/matrix\(|\)/g, '').split(',').map(Number);
-      if (parts.length >= 6) {
-        this.m11 = parts[0]; this.m21 = parts[1];
-        this.m12 = parts[2]; this.m22 = parts[3];
-        this.m41 = parts[4]; this.m42 = parts[5];
-      }
-    } else if (Array.isArray(init) && init.length >= 6) {
-      this.m11 = init[0]; this.m21 = init[1];
-      this.m12 = init[2]; this.m22 = init[3];
-      this.m41 = init[4]; this.m42 = init[5];
-    }
-  }
-
-  translateSelf(_tx: number, _ty: number) { return this; }
-  scaleSelf(_sx: number, _sy?: number) { return this; }
-  rotateSelf(_angle: number) { return this; }
-  multiplySelf(_other: any) { return this; }
-  transformPoint(_point: any) { return { x: 0, y: 0, z: 0, w: 1 }; }
-  is2D = true;
-  isIdentity = true;
+if (typeof globalThis.crypto === 'undefined') {
+  (globalThis as any).crypto = { getRandomValues: undefined, subtle: undefined };
 }
 
-// ---- DOMPoint ----
-class DOMPointPolyfill {
-  x = 0; y = 0; z = 0; w = 1;
-  constructor(_x?: number, _y?: number, _z?: number, _w?: number) {
-    if (_x !== undefined) this.x = _x;
-    if (_y !== undefined) this.y = _y;
-    if (_z !== undefined) this.z = _z;
-    if (_w !== undefined) this.w = _w;
-  }
-  static fromPoint(other?: { x: number; y: number; z?: number; w?: number }) {
-    if (other) return new DOMPointPolyfill(other.x, other.y, other.z, other.w);
-    return new DOMPointPolyfill();
-  }
-  matrixTransform(_matrix: any) { return this; }
+if (!(globalThis as any).crypto.subtle) {
+  (globalThis as any).crypto.subtle = {
+    digest: async (algorithm: string, data: BufferSource) => {
+      const buffer = data instanceof ArrayBuffer
+        ? Buffer.from(data)
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+      const hash = crypto.createHash(algorithm.toLowerCase().replace('-', ''));
+      hash.update(buffer);
+      return hash.digest();
+    },
+  };
 }
 
-// ---- Path2D ----
-class Path2DPolyfill {
-  addPath(_path: any, _transform?: any) {}
-  arc(_x: number, _y: number, _radius: number, _startAngle: number, _endAngle: number, _counterclockwise?: boolean) {}
-  arcTo(_x1: number, _y1: number, _x2: number, _y2: number, _radius: number) {}
-  bezierCurveTo(_cp1x: number, _cp1y: number, _cp2x: number, _cp2y: number, _x: number, _y: number) {}
-  closePath() {}
-  ellipse(_x: number, _y: number, _radiusX: number, _radiusY: number, _rotation: number, _startAngle: number, _endAngle: number, _counterclockwise?: boolean) {}
-  lineTo(_x: number, _y: number) {}
-  moveTo(_x: number, _y: number) {}
-  quadraticCurveTo(_cpx: number, _cpy: number, _x: number, _y: number) {}
-  rect(_x: number, _y: number, _w: number, _h: number) {}
-  roundRect(_x: number, _y: number, _w: number, _h: number, _radii?: number | number[]) {}
+// ──────────────────────────────────────────
+// 2. Path2D / DOMMatrix / Image (Stub)
+// ──────────────────────────────────────────
+(globalThis as any).Path2D = class Path2D {};
+(globalThis as any).DOMMatrix = class DOMMatrix {
+  a = 1; b = 0; c = 0; d = 1; e = 0; f = 0;
+};
+(globalThis as any).Image = class Image {
+  width = 0;
+  height = 0;
+  src = '';
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  constructor() {
+    setTimeout(() => {
+      if (this.onerror) this.onerror();
+    }, 0);
+  }
+};
+
+// ──────────────────────────────────────────
+// 3. XMLHttpRequest (Stub)
+// ──────────────────────────────────────────
+(globalThis as any).XMLHttpRequest = class XMLHttpRequest {
+  open() {}
+  send() {}
+};
+
+// ──────────────────────────────────────────
+// 4. Canvas polyfill (使用 node-canvas)
+// ──────────────────────────────────────────
+let canvasLoadError: string | null = null;
+
+try {
+  const { createCanvas, loadImage } = require('canvas');
+  (globalThis as any).HTMLCanvasElement = (globalThis as any).HTMLCanvasElement || class {};
+  (globalThis as any).createCanvas = createCanvas;
+  (globalThis as any).loadImage = loadImage;
+  canvasLoadError = null;
+  console.log('[pdf-polyfills] Canvas polyfill loaded successfully');
+} catch (err) {
+  canvasLoadError = (err as Error).message;
+  console.warn('[pdf-polyfills] Canvas polyfill not available:', canvasLoadError);
 }
 
-// ---- ImageData ----
-class ImageDataPolyfill {
-  readonly data: Uint8ClampedArray;
-  readonly width: number;
-  readonly height: number;
-  readonly colorSpace: string = 'srgb';
+export function getCanvasDiagnostics(): { available: boolean; error: string | null } {
+  return { available: canvasLoadError === null, error: canvasLoadError };
+}
 
-  constructor(width: number, height: number);
-  constructor(data: Uint8ClampedArray, width: number, height?: number);
-  constructor(arg1: number | Uint8ClampedArray, arg2: number, arg3?: number) {
-    if (arg1 instanceof Uint8ClampedArray) {
-      this.data = arg1;
-      this.width = arg2;
-      this.height = arg3 ?? 0;
+// ──────────────────────────────────────────
+// 5. pdfjs-dist 全局配置
+// ──────────────────────────────────────────
+import * as path from 'path';
+
+/**
+ * 解析 pdf.worker.mjs 路径并设置 Worker
+ *
+ * 采用两级递进策略兼容开发环境、普通构建、以及 ASAR 打包环境：
+ *   策略 1: 从 asar 中提取到临时目录，使用 file:// URL（离线可用、ESM loader 兼容）
+ *   策略 2: 直接禁用 Worker，主线程运行（兜底）
+ *
+ * Electron 打包为 asar 后，ESM loader 限制只能加载 file:/data:/node: 协议的模块。
+ * https:// CDN URL 被拒绝，因此必须将 Worker 文件提取到临时目录用 file:// 协议加载。
+ */
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+import * as os from 'os';
+
+/**
+ * 标记 Worker 是否已成功配置（用于 getDocumentSafe 决定是否禁用 Worker）
+ */
+let _workerConfigured = false;
+let _workerSetupError: string | null = null;
+
+async function setupPdfWorker(): Promise<void> {
+  const WORKER_FILENAME = 'pdf.worker.mjs';
+
+  // ── 策略 1: 从 asar 中提取到临时目录，使用 file:// URL ──
+  try {
+    const workerInAsar = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
+    const tmpDir = os.tmpdir();
+    const extractedPath = path.join(tmpDir, 'term-manager-' + WORKER_FILENAME);
+    const fs = require('fs');
+    if (!fs.existsSync(extractedPath)) {
+      fs.copyFileSync(workerInAsar, extractedPath);
+      console.log('[pdf-polyfills] Worker extracted to temp:', extractedPath);
     } else {
-      this.width = arg1;
-      this.height = arg2;
-      this.data = new Uint8ClampedArray(arg1 * arg2 * 4);
+      console.log('[pdf-polyfills] Worker already exists in temp:', extractedPath);
     }
+    const fileUrl = pathToFileURL(extractedPath).href;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = fileUrl;
+    _workerConfigured = true;
+    console.log('[pdf-polyfills] GlobalWorkerOptions.workerSrc set to file:', fileUrl);
+  } catch (e: any) {
+    _workerSetupError = e?.message || String(e);
+    console.warn('[pdf-polyfills] Worker extraction to temp failed:', _workerSetupError);
+    // ── 策略 2: 直接禁用 Worker ──
+    console.log('[pdf-polyfills] Worker will be disabled, PDF extraction runs on main thread');
   }
 }
 
-// ---- Install polyfills on globalThis ----
-if (typeof globalThis.DOMMatrix === 'undefined') {
-  (globalThis as any).DOMMatrix = DOMMatrixPolyfill;
-}
-if (typeof globalThis.DOMPoint === 'undefined') {
-  (globalThis as any).DOMPoint = DOMPointPolyfill;
-}
-if (typeof globalThis.Path2D === 'undefined') {
-  (globalThis as any).Path2D = Path2DPolyfill;
-}
-if (typeof globalThis.ImageData === 'undefined') {
-  (globalThis as any).ImageData = ImageDataPolyfill;
+// 立即异步设置 Worker（不阻塞模块加载）
+setupPdfWorker().catch(err => {
+  console.error('[pdf-polyfills] Worker setup failed:', err);
+});
+
+// ──────────────────────────────────────────
+// 6. Worker 加载失败的降级追踪
+// ──────────────────────────────────────────
+
+let _workerLoadFailed = false;
+
+/**
+ * PDF.js getDocument 的安全封装，自动处理 Worker 加载失败
+ *
+ * 当 Worker 加载失败时（asar ESM loader 限制、file:// 不可用等），
+ * 自动降级为 disableWorker: true（主线程渲染），功能完整但单线程运行。
+ */
+async function getDocumentSafe(
+  options: Record<string, any>
+): Promise<any> {
+  // 如果 Worker 未配置，或之前已确认不可用，直接禁用 Worker
+  if (!_workerConfigured || _workerLoadFailed) {
+    if (_workerLoadFailed) {
+      console.log('[pdf-polyfills] Worker previously failed, using disableWorker: true');
+    } else {
+      console.log('[pdf-polyfills] Worker not configured, using disableWorker: true');
+    }
+    const task = pdfjsLib.getDocument({ ...options, disableWorker: true } as any);
+    return (task as any).promise;
+  }
+
+  try {
+    const task = pdfjsLib.getDocument(options as any);
+    const doc = await (task as any).promise;
+    return doc;
+  } catch (error: any) {
+    const msg = error?.message || String(error);
+    // 检测是否是 Worker 相关的错误
+    if (
+      msg.includes('Setting up fake worker failed') ||
+      msg.includes('Cannot find module') ||
+      msg.includes('pdf.worker') ||
+      msg.includes('Only URLs with a scheme') ||
+      msg.includes('ESM loader') ||
+      msg.includes('worker')
+    ) {
+      _workerLoadFailed = true;
+      console.warn(
+        '[pdf-polyfills] Worker load failed, retrying with disableWorker: true\n' +
+        `  Error: ${msg.substring(0, 200)}`
+      );
+
+      // 直接降级：禁用 Worker
+      console.log('[pdf-polyfills] Falling back to disableWorker: true');
+      const fallbackTask = pdfjsLib.getDocument({ ...options, disableWorker: true } as any);
+      return (fallbackTask as any).promise;
+    }
+    // 非 Worker 相关错误，直接抛出
+    throw error;
+  }
 }
 
-console.log('[PDF Polyfills] Installed DOMMatrix, DOMPoint, Path2D, ImageData polyfills for pdfjs-dist');
+// ──────────────────────────────────────────
+// 7. 导出 pdfjsLib 和辅助函数供其他模块使用
+// ──────────────────────────────────────────
+export { pdfjsLib, getDocumentSafe };
+
+/**
+ * 渲染 PDF 页面到图片 buffer（PNG 格式）
+ * 使用 node-canvas（需要原生模块编译）
+ */
+export async function renderPageToImage(
+  page: any,
+  scale: number = 2.0
+): Promise<Buffer> {
+  const diagnostics = getCanvasDiagnostics();
+  let canvasLib: any;
+  try {
+    canvasLib = require('canvas');
+  } catch (e: any) {
+    const detail = diagnostics.error || e?.message || 'unknown error';
+    throw new Error(
+      `Canvas library not available. ${detail}\n` +
+      'Please rebuild canvas for Electron:\n' +
+      '  1. Install ClangCL via Visual Studio Installer (C++ Clang tools for Windows), OR\n' +
+      '  2. Downgrade Node.js to v20 LTS: nvm install 20 && nvm use 20\n' +
+      '  3. Then run: npm rebuild canvas'
+    );
+  }
+
+  const { createCanvas } = canvasLib;
+
+  let viewport: any;
+  if (typeof (page as any).getViewportRect === 'function') {
+    const rect = (page as any).getViewportRect({ scale });
+    viewport = { width: rect.width, height: rect.height };
+  } else {
+    viewport = page.getViewport({ scale });
+  }
+
+  const canvas = createCanvas(viewport.width, viewport.height);
+  const ctx = canvas.getContext('2d');
+
+  await page.render({
+    canvasContext: ctx,
+    viewport: viewport,
+  }).promise;
+
+  return canvas.toBuffer('image/png');
+}
+
+/**
+ * 渲染 PDF 页面为 SVG 字符串（零原生依赖）
+ * 使用 pdfjs-dist 内置的 SVGGraphics 引擎，无需 canvas/node-gyp
+ *
+ * @param page - PDF.js page 对象
+ * @param scale - 缩放比例（默认 2.0 以保证清晰度）
+ * @returns SVG 字符串
+ */
+export async function renderPageToSVG(
+  page: any,
+  scale: number = 2.0
+): Promise<string> {
+  // pdfjs-dist 4.x 中 SVGGraphics 位于 pdfjs-dist/legacy/build/pdf.mjs
+  // 需要通过 pdfjsLib 内部访问或单独 import
+  let SVGGraphics: any;
+
+  // 尝试不同的导入路径（pdfjs-dist 4.x）
+  try {
+    const svgMod = require('pdfjs-dist/legacy/build/pdf.mjs');
+    SVGGraphics = svgMod.SVGGraphics;
+  } catch {
+    // 某些打包环境下路径不同
+  }
+
+  if (!SVGGraphics) {
+    // fallback: 从 pdfjsLib 中获取
+    SVGGraphics = (pdfjsLib as any).SVGGraphics;
+  }
+
+  if (!SVGGraphics) {
+    throw new Error(
+      'SVGGraphics not available from pdfjs-dist. ' +
+      'Please ensure pdfjs-dist >= 4.0.0 is installed.'
+    );
+  }
+
+  // 兼容两种 API：page.getViewport（旧版）或 page.getViewportRect（新版）
+  let viewport: any;
+  if (typeof (page as any).getViewportRect === 'function') {
+    const rect = (page as any).getViewportRect({ scale });
+    viewport = { width: rect.width, height: rect.height };
+  } else {
+    viewport = page.getViewport({ scale });
+  }
+
+  // 使用 pdfjs-dist 的 SVGGraphics 引擎渲染
+  const svgGfx = new SVGGraphics(page.commonObjs, page.objs);
+  svgGfx.embedFonts = false; // 避免嵌入字体导致 SVG 过大
+
+  const svgRoot = await svgGfx.getSVG(page.getOperatorList(), viewport);
+
+  if (!svgRoot) {
+    throw new Error('SVGGraphics.getSVG returned null/undefined');
+  }
+
+  // 序列化 SVG DOM 为字符串
+  // 在 Node.js 中，SVGGraphics 返回的是 @xmldom/xmldom 的 Document 对象
+  let svgString: string;
+
+  if (typeof (svgRoot as any).outerHTML === 'string') {
+    svgString = (svgRoot as any).outerHTML;
+  } else if (typeof (svgRoot as any).toString === 'function') {
+    svgString = (svgRoot as any).toString();
+  } else {
+    // 使用 XMLSerializer（需要 xmldom polyfill，但 pdfjs-dist 内置了）
+    try {
+      const XMLSerializer = require('@xmldom/xmldom').XMLSerializer || globalThis.XMLSerializer;
+      const serializer = new XMLSerializer();
+      svgString = serializer.serializeToString(svgRoot);
+    } catch {
+      // 最后的 fallback：手动拼接基本 SVG 包装
+      const width = viewport.width;
+      const height = viewport.height;
+      svgString = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${String(svgRoot)}</svg>`;
+    }
+  }
+
+  console.log(`[pdf-polyfills] Page rendered to SVG: ${svgString.length} chars, viewport ${viewport.width}x${viewport.height}`);
+  return svgString;
+}
+
+// ──────────────────────────────────────────
+// 8. 常用配置常量
+// ──────────────────────────────────────────
+export const PDFJS_STANDARD_FONTS_URL = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/standard_fonts/';
+
+/**
+ * 从 PDF buffer 提取文本（文本型 PDF）
+ * 使用 pdfjs-dist 4.x 的 getDocument API
+ */
+export async function extractTextFromPDF(buffer: Buffer): Promise<string> {
+  const pdf = await getDocumentSafe({
+    data: new Uint8Array(buffer),
+    useSystemFonts: false,
+    standardFontDataUrl: PDFJS_STANDARD_FONTS_URL,
+  });
+
+  const textParts: string[] = [];
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+
+    const items = (content.items as any[]).sort((a, b) => {
+      const yDiff = (b.transform?.[5] ?? 0) - (a.transform?.[5] ?? 0);
+      if (Math.abs(yDiff) > 5) return yDiff;
+      return (a.transform?.[4] ?? 0) - (b.transform?.[4] ?? 0);
+    });
+
+    let lineText = '';
+    let lastY = -1;
+
+    for (const item of items) {
+      if (!item.str) continue;
+      const y = item.transform?.[5] ?? 0;
+
+      if (lastY !== -1 && Math.abs(y - lastY) > 3) {
+        textParts.push(lineText.trim());
+        lineText = '';
+      }
+
+      lineText += item.str + ' ';
+      lastY = y;
+    }
+    if (lineText.trim()) {
+      textParts.push(lineText.trim());
+    }
+
+    textParts.push('');
+  }
+
+  return textParts.join('\n').trim();
+}

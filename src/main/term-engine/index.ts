@@ -9,7 +9,8 @@ import {
 } from './smart-extractor';
 import { smartWebFetch } from '../javascript-renderer';
 import { ProgressReporter, ProgressStages, defaultProgressEstimator } from '../progress-reporter';
-import { extractHtmlContent, simpleHtmlToText } from '../html-content-extractor';
+import { extractHtmlContent, simpleHtmlToText, extractBilingualTableRows, formatBilingualPairsForExtraction, sanitizeHtmlForAI } from '../html-content-extractor';
+import { getCanvasDiagnostics } from '../pdf-polyfills';
 import { 
   extractTermsFromPDFViaAI, 
   type AIExtractionProgressCallback
@@ -125,12 +126,14 @@ function countWords(words: string[]): Record<string, number> {
 
 /**
  * 检测文本的语言
- * 返回 'zh' 中文、'en' 英文、'mixed' 中英混合
- * 当检测到混合语言时也返回检测结果，便于引导到双语抽取
+ * 返回语种代码和是否双语标记
+ * 支持：zh(中文)、en(英文)、fr(法文)、de(德文)、es(西班牙文)、
+ *       ja(日文)、ko(韩文)、ru(俄文)、ar(阿拉伯文)、it(意大利文)、pt(葡萄牙文)
+ * 混合语言时返回 'mixed'，并通过 isBilingual 标记
  * 
- * [改进] 提高混合触发门槛 + 绝对字符数判断，避免HTML噪声误导
+ * [改进v2] 支持非英文拉丁语系识别 + 多语种混合检测
  */
-function detectTextLanguage(text: string): { lang: 'zh' | 'en' | 'mixed'; isBilingual: boolean } {
+function detectTextLanguage(text: string): { lang: string; isBilingual: boolean } {
   if (!text || text.length < 10) {
     return { lang: 'en', isBilingual: false };
   }
@@ -139,30 +142,105 @@ function detectTextLanguage(text: string): { lang: 'zh' | 'en' | 'mixed'; isBili
   const cleanText = text.replace(/\s+/g, '');
   const totalChars = cleanText.length || 1;
 
+  // === 各语种字符计数 ===
   const zhCount = (cleanText.match(/[\u4e00-\u9fa5]/g) || []).length;
-  const enCount = (cleanText.match(/[a-zA-Z]/g) || []).length;
+  const jaCount = (cleanText.match(/[\u3040-\u309f\u30a0-\u30ff]/g) || []).length; // 日文假名
+  const koCount = (cleanText.match(/[\uac00-\ud7af]/g) || []).length; // 韩文
+  const ruCount = (cleanText.match(/[\u0400-\u04ff]/g) || []).length; // 俄文
+  const arCount = (cleanText.match(/[\u0600-\u06ff]/g) || []).length; // 阿拉伯文
+  const latinCount = (cleanText.match(/[a-zA-Z]/g) || []).length; // 所有拉丁字母（英文/法文/德文/西班牙文/意大利文/葡萄牙文共用）
 
+  // === 非拉丁语系判定（基于特有字符集，高置信度）===
   const zhRatio = zhCount / totalChars;
-  const enRatio = enCount / totalChars;
+  const jaRatio = jaCount / totalChars;
+  const koRatio = koCount / totalChars;
+  const ruRatio = ruCount / totalChars;
+  const arRatio = arCount / totalChars;
 
-  // [改进] 如果中文字符绝对数量≥200且占比高于英文，直接判定为中文
-  // 这能防止"中文正文+少量英文导航词"被误判为mixed
-  if (zhCount >= 200 && zhRatio > enRatio) {
+  // === 非拉丁语系单语判定（日/韩/俄/阿等） ===
+  // 非拉丁语系具有独特的Unicode字符集，高置信度优先判定
+  if (jaRatio > 0.4) return { lang: 'ja', isBilingual: false };
+  if (koRatio > 0.4) return { lang: 'ko', isBilingual: false };
+  if (ruRatio > 0.4) return { lang: 'ru', isBilingual: false };
+  if (arRatio > 0.4) return { lang: 'ar', isBilingual: false };
+
+  // === 双语检测：中文 + 其他语种混合 ===
+  // [修复] 双语检测必须在"中文占绝对主导"判定之前运行
+  // 否则中文字符≥200且比例>0.5时会错误地覆盖双语标签
+  if (zhRatio > 0.15) {
+    if (jaRatio > 0.05) return { lang: 'mixed', isBilingual: true };  // 中日混合
+    if (koRatio > 0.05) return { lang: 'mixed', isBilingual: true };  // 中韩混合
+    if (ruRatio > 0.05) return { lang: 'mixed', isBilingual: true };  // 中俄混合
+    if (arRatio > 0.05) return { lang: 'mixed', isBilingual: true };  // 中阿混合
+    if (latinCount / totalChars > 0.15) return { lang: 'mixed', isBilingual: true }; // 中+拉丁语系混合
+  }
+
+  // === 中文占绝对主导（在双语检测不命中时生效） ===
+  if (zhCount >= 200 && zhRatio > 0.5) {
+    return { lang: 'zh', isBilingual: false };
+  }
+  if (zhRatio > 0.7) {
     return { lang: 'zh', isBilingual: false };
   }
 
-  // [改进] 混合语言触发门槛从5%提高到15%，减少噪声误判
-  if (zhRatio > 0.15 && enRatio > 0.15) {
+  // === 拉丁语系：检测具体语种的专用词/特征来区分 ===
+  if (latinCount > 50) {
+    const detectedLatinLang = detectLatinScriptLanguage(cleanText);
+    if (detectedLatinLang) return { lang: detectedLatinLang, isBilingual: false };
+  }
+
+  // 中文少量+拉丁语系主导 → mixed
+  if (zhRatio > 0.05 && latinCount / totalChars > 0.3) {
     return { lang: 'mixed', isBilingual: true };
   }
 
-  // 中文占主导
-  if (zhRatio > 0.3) {
-    return { lang: 'zh', isBilingual: false };
+  // 默认：拉丁字母为主 → 英文（保守）
+  return { lang: 'en', isBilingual: false };
+}
+
+/**
+ * 拉丁字母语系细粒度识别
+ * 通过高置信度功能词/常见词区分英文、法文、德文、西班牙文、意大利文、葡萄牙文
+ */
+function detectLatinScriptLanguage(text: string): string | null {
+  const lower = text.toLowerCase();
+  
+  // 各语种高置信度功能词/常见词集合（特征词）
+  const langFeatures: { lang: string; words: string[] }[] = [
+    { lang: 'fr', words: [' le ', ' la ', ' les ', ' des ', ' une ', ' et ', ' dans ', ' pour ', ' avec ', ' sur ', ' que ', ' qui ', ' sont ', ' cette ', ' aussi ', ' plus ', ' mais ', ' tout ', ' leur ', ' deux ', ' france', 'développement', 'gouvernement', 'politique', 'économie', 'croissance', 'emploi', 'formation', 'entreprise'] },
+    { lang: 'de', words: [' und ', ' die ', ' der ', ' das ', ' mit ', ' von ', ' für ', ' auf ', ' ist ', ' sich ', ' ein ', 'eine ', ' werden ', ' auch ', ' nicht', 'Deutschland', 'Entwicklung', 'Regierung', 'Wirtschaft'] },
+    { lang: 'es', words: [' el ', ' la ', ' los ', ' las ', ' que ', ' una ', ' por ', ' con ', ' para ', ' del ', ' las ', ' más ', ' como ', ' este ', ' entre ', 'desarrollo', 'gobierno', 'economía', 'empresa', 'formación', 'España'] },
+    { lang: 'it', words: [' il ', ' la ', ' che ', ' una ', ' per ', ' con ', ' del ', ' sono ', ' come ', ' questa ', ' più ', 'Italia', 'sviluppo', 'governo', 'economia', 'impresa', 'formazione'] },
+    { lang: 'pt', words: [' o ', ' a ', ' os ', ' as ', ' que ', ' uma ', ' para ', ' com ', ' não ', ' mais ', ' como ', ' entre ', 'desenvolvimento', 'governo', 'economia', 'empresa', 'Brasil', 'formação', 'crescimento'] },
+    { lang: 'en', words: [' the ', ' and ', ' for ', ' with ', ' that ', ' this ', ' have ', ' they ', ' are ', ' from ', ' their ', ' which ', ' about ', ' there ', ' would ', 'development', 'government', 'economy', 'growth', 'policy', 'education'] },
+  ];
+
+  const scores: Record<string, number> = {};
+  for (const feat of langFeatures) {
+    scores[feat.lang] = 0;
+    for (const word of feat.words) {
+      if (lower.includes(word)) {
+        scores[feat.lang] += 1;
+      }
+    }
   }
 
-  // 英文占主导
-  return { lang: 'en', isBilingual: false };
+  // 找到最高分
+  let bestLang = 'en';
+  let bestScore = 0;
+  for (const [lang, score] of Object.entries(scores)) {
+    if (score > bestScore) {
+      bestScore = score;
+      bestLang = lang;
+    }
+  }
+
+  // 最低3个特征词命中才算高置信度
+  if (bestScore >= 3) {
+    return bestLang;
+  }
+
+  return null; // 无法确定
 }
 
 /**
@@ -330,12 +408,13 @@ function extractFromVocabEntries(entriesText: string): ExtractedTerm[] {
     if (seen.has(key)) continue;
     seen.add(key);
     
+    const targetLang = detectLatinScriptLanguage(englishTranslation) || 'en';
     terms.push({
       term_text: chineseTerm,
       score: 10,
       source_lang: 'zh',
       target_term: englishTranslation,
-      target_lang: 'en',
+      target_lang: targetLang,
       translation_source: 'numbered-vocab-list',
       translation_confidence: 0.85,
     });
@@ -926,15 +1005,47 @@ function mergeAndDedupRuleResults(allResults: ExtractedTerm[][]): ExtractedTerm[
  *    - AI内部已包含分块逻辑（>15000字触发）
  *    - AI失败时降级到规则模式
  */
+/**
+ * 抽取元数据 —— 用于向调用方传递抽取过程中的状态信息（如是否AI降级）
+ */
+export interface ExtractionMetadata {
+  /** 最终使用的抽取模式 */
+  mode: 'ai-only' | 'ai-degraded-to-rules' | 'rules-only' | 'numbered-vocab-list' | 'ai-bilingual' | 'bilingual-rules';
+  /** AI降级原因（仅在 mode='ai-degraded-to-rules' 时有值） */
+  fallbackReason?: string;
+  /** 降级前的AI错误信息（诊断用） */
+  aiError?: string;
+  /** 原始检测到的语言 */
+  detectedLanguage?: string;
+  /** 是否为双语文本 */
+  isBilingual?: boolean;
+}
+
 export async function extractTermsFromText(
   text: string,
   language: 'en' | 'zh' | 'auto' = 'auto',
   useAI = false,
   aiConfig?: AIConfig
 ): Promise<ExtractedTerm[]> {
+  const result = await extractTermsFromTextWithMeta(text, language, useAI, aiConfig);
+  return result.terms;
+}
+
+/**
+ * 增强版术语抽取 —— 同时返回术语列表和抽取元数据
+ * 调用方可通过 metadata.fallbackReason 判断AI是否降级，并在UI上提示用户
+ */
+export async function extractTermsFromTextWithMeta(
+  text: string,
+  language: 'en' | 'zh' | 'auto' = 'auto',
+  useAI = false,
+  aiConfig?: AIConfig
+): Promise<{ terms: ExtractedTerm[]; metadata: ExtractionMetadata }> {
+  const emptyMeta: ExtractionMetadata = { mode: 'rules-only' };
+
   if (!text || text.trim().length === 0) {
     console.warn('[Term Engine] Empty text provided');
-    return [];
+    return { terms: [], metadata: { ...emptyMeta, fallbackReason: '空文本' } };
   }
 
   const trimmedText = text.trim();
@@ -950,7 +1061,10 @@ export async function extractTermsFromText(
       const vocabTerms = extractFromVocabEntries(parsedText);
       if (vocabTerms.length > 0) {
         console.log(`[Term Engine] Using numbered vocabulary list fast track: ${vocabTerms.length} terms extracted`);
-        return vocabTerms.slice(0, DEFAULT_STRATEGY.maxResults || 300);
+        return {
+          terms: vocabTerms.slice(0, DEFAULT_STRATEGY.maxResults || 300),
+          metadata: { mode: 'numbered-vocab-list' }
+        };
       }
     }
     // 如果解析失败（如正则不匹配），继续走正常流程
@@ -958,15 +1072,22 @@ export async function extractTermsFromText(
   }
 
   // ========== 语言检测 ==========
-  let actualLang = language;
+  let actualLang: string = language;
+  let detectedIsBilingual = false; // [修复] 保存双语标记，用于AI降级场景
   if (language === 'auto') {
     const detected = detectTextLanguage(trimmedText);
     console.log(`[Term Engine] Language detection result: ${detected.lang}, isBilingual: ${detected.isBilingual}`);
-    // [修复] mixed双语文本默认使用zh（中文网站/文档中双语词汇表比纯英文文章更常见）
-    // 后续词汇表检测器会进一步处理双语对照格式
-    actualLang = detected.lang === 'mixed' ? 'zh' : detected.lang;
+    // [修复v2] mixed双语文本先标记为mixed，由后续流程根据具体语言对处理
+    actualLang = detected.lang;
+    detectedIsBilingual = detected.isBilingual;
     console.log(`[Term Engine] Using detected language: ${actualLang}`);
   }
+
+  const metadata: ExtractionMetadata = {
+    mode: useAI ? 'ai-only' : 'rules-only',
+    detectedLanguage: actualLang,
+    isBilingual: detectedIsBilingual,
+  };
 
   // ═══════════════════════════════════════════
   // 路径一：AI增强模式
@@ -984,7 +1105,8 @@ export async function extractTermsFromText(
       };
       
       console.log('[Term Engine] Submitting full text to AI for smart extraction...');
-      const smartResults = await smartExtractTermsImpl(trimmedText, actualLang, strategy);
+      // 始终传 'auto' 让AI自行判断语言场景，不预设 actualLang（双语文本会被强制设为 'zh' 导致丢失外文术语）
+      const smartResults = await smartExtractTermsImpl(trimmedText, 'auto', strategy);
       console.log(`[Term Engine] AI extraction completed, got ${smartResults.length} smart terms`);
       
       if (smartResults.length > 0) {
@@ -992,7 +1114,7 @@ export async function extractTermsFromText(
           .map(term => ({
             term_text: term.term_text,
             score: Math.round(term.score),
-            source_lang: term.source_lang || actualLang,
+            source_lang: term.source_lang || 'zh', // AI已通过新prompt自行判断source_lang，fallback 用 'zh' 覆盖缺省情况
             target_term: term.target_term,
             target_lang: term.target_lang,
             translation_source: term.translation_source,
@@ -1001,20 +1123,38 @@ export async function extractTermsFromText(
           }))
           .slice(0, DEFAULT_STRATEGY.maxResults || 300);
         
-        // 后过滤：去除碎片化术语
-        const beforeFilter = results.length;
-        results = filterFragmentaryTerms(results);
-        if (results.length < beforeFilter) {
-          console.log(`[Term Engine] Post-filter removed ${beforeFilter - results.length} fragmentary terms (kept ${results.length})`);
-        }
+        // [修复] AI-only 模式：跳过 filterFragmentaryTerms
+        // AI 已有内置 Prompt 完成语义完整性判断，后过滤的<4字长度限制、
+        // 动词前缀/虚词黑名单等规则会误杀合法术语（如AI、API缩写、
+        // "研究型大学""对称加密"等合法复合术语），导致网页抽取几乎全军覆没
+        // 仅保留 smart-extractor 内部的 JSON字段名/纯数字等噪声过滤
+        console.log(`[Term Engine] AI-only mode: skipping filterFragmentaryTerms (AI self-filters, trust AI quality). ${results.length} terms kept.`);
         
         console.log(`[Term Engine] AI path final results: ${results.length} terms`);
-        return results;
+
+        // [P0] AI结果质量预检：双语文本但AI只返回了单一语言术语
+        if (detectedIsBilingual && results.length > 0) {
+          const hasTargetTerms = results.filter(t => t.target_term && t.target_term.length > 0).length;
+          const hasEnSource = results.filter(t => t.source_lang === 'en' || t.source_lang === 'fr' || t.source_lang === 'de' || t.source_lang === 'es').length;
+          if (hasTargetTerms === 0 && hasEnSource === 0) {
+            metadata.mode = 'ai-degraded-to-rules';
+            metadata.fallbackReason = 'AI returned only single-language terms for bilingual text (no target_term or foreign source_lang)';
+            metadata.aiError = `AI returned ${results.length} terms but all source_lang=zh with no target_term`;
+            console.warn(`[Term Engine] AI quality check failed: ${metadata.fallbackReason}. Falling back to rules for bilingual extraction.`);
+          }
+        }
+
+        return { terms: results, metadata };
       }
       
       // AI返回空结果 → 降级到规则模式
+      metadata.mode = 'ai-degraded-to-rules';
+      metadata.fallbackReason = 'AI returned 0 terms (no results)';
       console.log('[Term Engine] AI returned 0 terms, falling back to rules-only path');
     } catch (error) {
+      metadata.mode = 'ai-degraded-to-rules';
+      metadata.fallbackReason = 'AI extraction error';
+      metadata.aiError = error instanceof Error ? error.message : String(error);
       console.error('[Term Engine] AI extraction failed, falling back to rules-only path:', error);
     }
   }
@@ -1023,8 +1163,34 @@ export async function extractTermsFromText(
   // 路径二：纯规则模式（未开启AI或AI失败降级）
   // ═══════════════════════════════════════════
   
+  // [修复] AI降级时，首先尝试编号词汇列表快速通道作为高优先级后备
+  // 因为AI可能因PDF紧凑格式（无空格词汇表）而返回空，但规则解析器能正确处理
+  if (useAI && aiConfig && detectNumberedVocabList(trimmedText)) {
+    const parsedText = parseNumberedVocabList(trimmedText);
+    if (parsedText) {
+      const vocabTerms = extractFromVocabEntries(parsedText);
+      if (vocabTerms.length > 0) {
+        console.log(`[Term Engine] AI degradation: numbered vocab list fast track rescued ${vocabTerms.length} terms (AI returned empty/errored)`);
+        return {
+          terms: vocabTerms.slice(0, DEFAULT_STRATEGY.maxResults || 300),
+          metadata: {
+            ...metadata,
+            mode: 'ai-degraded-to-rules',
+            fallbackReason: metadata.fallbackReason || 'AI returned 0 terms, rescued by vocab list fast track',
+          }
+        };
+      }
+    }
+  }
+  
+  // [修复P0-2] AI降级时利用原始检测的双语标记
+  // 如果原始语言检测判定为双语，但actualLang被设为'zh'/'en'单语 → 强制改为mixed走双语路径
+  if (useAI && aiConfig && detectedIsBilingual && actualLang !== 'mixed') {
+    console.log(`[Term Engine] AI degradation: original text was bilingual (detectedIsBilingual=true), forcing actualLang from '${actualLang}' to 'mixed' for bilingual rule extraction`);
+    actualLang = 'mixed';
+  }
+  
   // [改进] AI降级时对文本做二次语言检测，避免原始检测被HTML噪声误导
-  // 如果原始检测结果为 'en' 或 'mixed'，但文本实际主要是中文，纠正为 'zh'
   if (useAI && aiConfig && actualLang === 'en') {
     const reDetected = detectTextLanguage(trimmedText);
     if (reDetected.lang === 'zh' || (reDetected.lang === 'mixed' && reDetected.isBilingual)) {
@@ -1059,9 +1225,35 @@ export async function extractTermsFromText(
     } else {
       results = extractEnglishTerms(trimmedText);
     }
+  } else if (actualLang === 'mixed') {
+    // [修复v2] 双语混合文本 → 优先尝试词汇表检测器，然后中英分别抽取
+    console.log(`[Term Engine] Mixed language text → trying vocab list detector first`);
+    const vocabTerms = extractFromVocabEntries(trimmedText);
+    if (vocabTerms.length > 0) {
+      results = vocabTerms;
+    } else {
+      // 降级：中英分别抽取
+      const zhTerms = extractChineseTerms(trimmedText);
+      const enLatinTerms = extractEnglishTerms(trimmedText);
+      results = mergeAndDedupRuleResults([zhTerms, enLatinTerms]);
+    }
+  } else if (['fr','de','es','it','pt'].includes(actualLang)) {
+    // [修复v2] 非英文拉丁语系 → 使用通用拉丁语系术语抽取
+    console.log(`[Term Engine] Latin-script language (${actualLang}) → generic Latin term extraction`);
+    const latinTerms = extractLatinScriptTerms(trimmedText, actualLang);
+    results = latinTerms.map(t => ({
+      ...t,
+      source_lang: actualLang,
+    }));
   } else {
-    console.warn(`[Term Engine] Unhandled language: ${actualLang}`);
-    return [];
+    // 其他语种（如 ja, ko, ru, ar）
+    console.warn(`[Term Engine] Unhandled language: ${actualLang} — trying generic extraction`);
+    const genericTerms = extractLatinScriptTerms(trimmedText, actualLang);
+    if (actualLang === 'ja' || actualLang === 'ko' || actualLang === 'ru' || actualLang === 'ar') {
+      results = genericTerms.map(t => ({ ...t, source_lang: actualLang }));
+    } else {
+      return { terms: [], metadata };
+    }
   }
   
   // 后过滤：去除碎片化术语
@@ -1075,7 +1267,7 @@ export async function extractTermsFromText(
   results = results.slice(0, DEFAULT_STRATEGY.maxResults || 300);
   
   console.log(`[Term Engine] Rules path final results: ${results.length} terms`);
-  return results;
+  return { terms: results, metadata };
 }
 
 /**
@@ -1151,27 +1343,315 @@ function extractEnglishTerms(text: string): ExtractedTerm[] {
 }
 
 /**
- * Extract text from a PDF buffer using pdfjs-dist.
- * Uses module.createRequire for proper CJS loading in bundled Electron context.
+ * [新增] 通用拉丁语系术语抽取（fr/de/es/it/pt）
+ * 由于这些语言共享拉丁字母，规则模式无法像中/英那样依赖字符集区分
+ * 采用基于大写字母的专有名词识别 + n-gram + 专业术语特征匹配
  */
-async function extractTextFromPDF(dataBuffer: Buffer): Promise<string> {
-  const { createRequire } = await import('module');
-  const nodeRequire = createRequire(import.meta.url || __filename);
-  const pdfjsLib: any = nodeRequire('pdfjs-dist/legacy/build/pdf.js');
+function extractLatinScriptTerms(text: string, lang: string): ExtractedTerm[] {
+  // 大写专有名词/缩写识别（通用拉丁语系特征）
+  const properNouns = new Set<string>();
   
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(dataBuffer) });
-  const pdf = await loadingTask.promise;
+  // 匹配连续大写字母开头的专有名词组（如 "Développement Durable", "Assemblée Nationale"）
+  const properPhrasePattern = /((?:[A-ZÀ-Ü][a-zà-ü]+\s*){2,})/g;
+  let match;
+  while ((match = properPhrasePattern.exec(text)) !== null) {
+    const phrase = match[1].trim();
+    if (phrase.length >= 3 && phrase.length <= 80) {
+      properNouns.add(phrase);
+    }
+  }
+
+  // 匹配纯大写缩写（2-6字母，含带变音符号的大写字母）
+  const uppercasePattern = /\b([A-ZÀ-Ü]{2,8})\b/g;
+  while ((match = uppercasePattern.exec(text)) !== null) {
+    const abbrev = match[1];
+    if (abbrev.length >= 2) {
+      properNouns.add(abbrev);
+    }
+  }
+
+  // 各语种专业后缀匹配（提升召回的专业术语）
+  const langSuffixes: Record<string, string[]> = {
+    fr: ['tion', 'ment', 'ence', 'ance', 'ique', 'isme', 'logie', 'graphie', 'métrie', 'nomie', 'ité', 'aire', 'sation', 'isement'],
+    de: ['tion', 'heit', 'keit', 'ung', 'schaft', 'ismus', 'logie', 'graphie', 'metrie', 'nomie'],
+    es: ['ción', 'sión', 'dad', 'tad', 'ismo', 'logía', 'grafía', 'metría', 'nomía', 'miento'],
+    it: ['zione', 'mento', 'enza', 'anza', 'ismo', 'logia', 'grafia', 'metria', 'nomia', 'ità'],
+    pt: ['ção', 'são', 'dade', 'ismo', 'logia', 'grafia', 'metria', 'nomia', 'mento', 'ência', 'ância'],
+  };
+
+  const suffixes = langSuffixes[lang] || langSuffixes['fr'];
+  
+  // 通用专业术语特征（拉丁语系通用）
+  const professionalPatterns = [
+    /\b[A-Z][a-zà-ü]+(?:sation|isation|isierung|ización|izzazione|ização)\b/g,
+    /\b[A-Za-zà-ü]+(?:développement|entwicklung|desarrollo|sviluppo|desenvolvimento)\b/gi,
+    ...suffixes.map(s => new RegExp(`\\b[A-Za-zà-ü]+${s}\\b`, 'gi')),
+  ];
+
+  const profTerms = new Set<string>();
+  for (const pattern of professionalPatterns) {
+    let m;
+    while ((m = pattern.exec(text)) !== null) {
+      const term = m[0].trim();
+      if (term.length >= 4 && term.length <= 50) {
+        profTerms.add(term);
+      }
+    }
+  }
+
+  // 2-4元n-gram（基于单词拆分）
+  const words = text
+    .split(/[\s,;:.!?()[\]{}'"&|/\\]+/)
+    .filter(w => w.length >= 2 && /[a-zA-ZÀ-Üà-ü]/.test(w));
+
+  if (words.length === 0) return [];
+
+  const ngrams: string[] = [];
+  for (let n = 1; n <= 4; n++) {
+    for (let i = 0; i <= words.length - n; i++) {
+      const ngram = words.slice(i, i + n).join(' ');
+      if (ngram.length >= 4 && ngram.length <= 80) {
+        ngrams.push(ngram);
+      }
+    }
+  }
+
+  const freq = new Map<string, number>();
+  for (const term of [...properNouns, ...profTerms, ...ngrams]) {
+    freq.set(term, (freq.get(term) || 0) + 1);
+  }
+
+  const langStopWords: Record<string, Set<string>> = {
+    fr: new Set(['le', 'la', 'les', 'un', 'une', 'des', 'et', 'ou', 'que', 'qui', 'dans', 'pour', 'avec', 'sur', 'pas', 'ne', 'se', 'ce', 'de', 'du', 'au', 'aux', 'est', 'sont', 'plus', 'moins', 'tout', 'tous', 'leur', 'leurs', 'nous', 'vous', 'ils', 'elles', 'lui', 'leur']),
+    de: new Set(['der', 'die', 'das', 'und', 'oder', 'mit', 'von', 'für', 'auf', 'ist', 'sind', 'sich', 'ein', 'eine', 'nicht', 'auch', 'werden']),
+    es: new Set(['el', 'la', 'los', 'las', 'un', 'una', 'que', 'por', 'con', 'para', 'del', 'las', 'más', 'como', 'este', 'entre', 'pero']),
+    it: new Set(['il', 'la', 'i', 'le', 'un', 'una', 'che', 'per', 'con', 'del', 'sono', 'come', 'questa', 'più']),
+    pt: new Set(['o', 'a', 'os', 'as', 'um', 'uma', 'que', 'para', 'com', 'não', 'mais', 'como', 'entre']),
+  };
+
+  const stopWords = langStopWords[lang] || langStopWords['fr'];
+
+  const results: ExtractedTerm[] = [];
+  for (const [term_text, count] of freq) {
+    const wordsInTerm = term_text.split(' ');
+    const meaningfulWords = wordsInTerm.filter(w => !stopWords.has(w.toLowerCase()));
+    if (meaningfulWords.length === 0) continue;
+
+    let score = count;
+    if (languageSpecificTermPatterns(term_text, lang)) score *= 2;
+    if (/[A-ZÀ-Ü]/.test(term_text[0])) score *= 1.3;
+    if (wordsInTerm.length > 1) score *= 1.2;
+
+    results.push({ term_text, score: Math.round(score), source_lang: lang });
+  }
+
+  return results.sort((a, b) => b.score - a.score);
+}
+
+/**
+ * 拉丁语系术语领域特征识别
+ */
+function languageSpecificTermPatterns(term: string, lang: string): boolean {
+  const patterns: Record<string, RegExp[]> = {
+    fr: [/développement|gouvernement|politique|économ|formation|entreprise|stratég|sécurit|environnement/i],
+    de: [/entwicklung|regierung|politik|wirtschaft|bildung|unternehmen|strategie|sicherheit|umwelt/i],
+    es: [/desarrollo|gobierno|política|economía|formación|empresa|estrategia|seguridad|medio ambiente/i],
+    it: [/sviluppo|governo|politica|economia|formazione|impresa|strategia|sicurezza|ambiente/i],
+    pt: [/desenvolvimento|governo|política|economia|formação|empresa|estratégia|segurança|ambiente/i],
+  };
+  const langPatterns = patterns[lang] || [];
+  return langPatterns.some(p => p.test(term));
+}
+
+/**
+ * 多策略加载 pdfjs-dist legacy 构建，兼容：
+ * - electron-vite 开发模式（ESM + "type":"module"）
+ * - electron-vite 打包后（CJS 产物，require 可用）
+ * 策略优先级：
+ *   1. createRequire（ESM 环境最佳方案）
+ *   2. 动态 import()（纯 ESM 原生方案）
+ *   3. new Function require（打包后 CJS 兜底）
+ */
+async function loadPdfjsDistLegacy(loadErrors: string[]): Promise<any> {
+  // 策略1：createRequire（ESM → CJS 桥接，electron-vite 开发模式下最可靠）
+  try {
+    const { createRequire } = await import('module');
+    const resolveBase = typeof __filename !== 'undefined' ? __filename : process.cwd() + '/dummy.mjs';
+    const nodeRequire = createRequire(import.meta.url || resolveBase || process.cwd() + '/dummy.mjs');
+    const lib = nodeRequire('pdfjs-dist/legacy/build/pdf.mjs');
+    if (lib?.getDocument) {
+      console.log('[Term Engine] PDF.js loaded via createRequire');
+      return lib;
+    }
+    loadErrors.push('createRequire: 加载成功但 getDocument 不可用');
+  } catch (e) {
+    loadErrors.push(`createRequire: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // 策略2：动态 import()（纯 ESM 原生方案）
+  try {
+    const mod = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const lib = (mod as any).default || mod;
+    if (lib?.getDocument) {
+      console.log('[Term Engine] PDF.js loaded via dynamic import()');
+      return lib;
+    }
+    loadErrors.push('动态 import(): 加载成功但 getDocument 不可用');
+  } catch (e) {
+    loadErrors.push(`动态 import(): ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // 策略3：new Function require（打包后 electron-vite 输出 CJS 环境兜底）
+  try {
+    const loader = new Function("return require('pdfjs-dist/legacy/build/pdf.mjs')");
+    const lib = loader();
+    if (lib?.getDocument) {
+      console.log('[Term Engine] PDF.js loaded via new Function require');
+      return lib;
+    }
+    loadErrors.push('new Function require: 加载成功但 getDocument 不可用');
+  } catch (e) {
+    loadErrors.push(`new Function require: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  return null;
+}
+
+/**
+ * 解析 pdfjs-dist 的安装路径，用于配置字体文件路径
+ */
+async function resolvePdfjsDistPath(loadErrors: string[]): Promise<string | null> {
+  try {
+    const { createRequire } = await import('module');
+    const base = typeof __filename !== 'undefined' ? __filename : process.cwd() + '/dummy.mjs';
+    const nodeRequire = createRequire(import.meta.url || base);
+    return nodeRequire.resolve('pdfjs-dist/legacy/build/pdf.mjs');
+  } catch {
+    try {
+      const loader = new Function("return require.resolve('pdfjs-dist/legacy/build/pdf.mjs')");
+      return loader();
+    } catch (e) {
+      loadErrors.push(`解析 pdfjs-dist 路径失败: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+  }
+}
+
+/**
+ * 从已加载的 PDF 文档中提取所有页面文本
+ */
+async function extractPagesText(pdf: any): Promise<string> {
   const maxPages = pdf.numPages;
+
+  if (maxPages <= 0) {
+    throw new Error(`PDF 文件解析失败: 页面数为 ${maxPages}`);
+  }
+
+  console.log(`[Term Engine] PDF has ${maxPages} pages, extracting text...`);
   const pageTexts: string[] = [];
 
   for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
     const content = await page.getTextContent();
-    const strings = content.items.map((item: any) => item.str ?? '');
-    pageTexts.push(strings.join(' '));
+
+    if (!content?.items || content.items.length === 0) {
+      console.log(`[Term Engine] Page ${pageNum}: no text items found (可能为图片型PDF页面)`);
+      continue;
+    }
+
+    const pageText = content.items.map((item: any) => item.str ?? '').join(' ').trim();
+    if (pageText.length > 0) {
+      pageTexts.push(pageText);
+      console.log(`[Term Engine] Page ${pageNum}: extracted ${pageText.length} chars`);
+    }
   }
 
-  return pageTexts.join('\n');
+  const fullText = pageTexts.join('\n');
+
+  // 检测是否为图片型PDF
+  if (fullText.trim().length === 0) {
+    console.warn('[Term Engine] 警告: PDF文本提取为空，这可能是图片型PDF（扫描件），建议使用AI视觉模式或OCR');
+  }
+
+  return fullText;
+}
+
+/**
+ * 使用 pdfjs-dist 4.x legacy 构建加载 PDF 文本提取
+ * pdfjs-dist 4.x 将 legacy 构建文件从 .js 改为 .mjs，需要用 new Function 动态 require
+ * 在 Electron 打包后环境中可回退到 createRequire 方式
+ */
+async function extractTextFromPDF(dataBuffer: Buffer): Promise<string> {
+  const loadErrors: string[] = [];
+  
+  // 加载 pdfjs-dist legacy 构建。electron-vite + "type":"module" 环境下
+  // 优先使用 createRequire / 动态 import，避免 "require is not defined"。
+  const pdfjsLib = await loadPdfjsDistLegacy(loadErrors);
+
+  if (!pdfjsLib) {
+    throw new Error(
+      `PDF解析引擎加载失败，请确认 pdfjs-dist 依赖已正确安装。\n` +
+      `错误详情:\n${loadErrors.map((e, i) => `  [${i + 1}] ${e}`).join('\n')}`
+    );
+  }
+
+  // 配置标准字体数据 URL，避免中文字体渲染警告
+  try {
+    if (pdfjsLib.GlobalWorkerOptions) {
+      const pdfjsDistPath = await resolvePdfjsDistPath(loadErrors);
+      if (pdfjsDistPath) {
+        const pdfjsDir = pdfjsDistPath.replace(/[\\/]pdf\.mjs$/, '');
+        const cMapUrl = `file://${pdfjsDir}/cmaps/`;
+        const standardFontDataUrl = `file://${pdfjsDir}/standard_fonts/`;
+        pdfjsLib.GlobalWorkerOptions.standardFontDataUrl = standardFontDataUrl;
+        pdfjsLib.GlobalWorkerOptions.cMapUrl = cMapUrl;
+        console.log(`[Term Engine] PDF.js font paths configured: cmaps=${cMapUrl}, fonts=${standardFontDataUrl}`);
+      }
+    }
+  } catch (configError) {
+    console.warn(`[Term Engine] PDF.js font path configuration failed (non-critical): ${configError instanceof Error ? configError.message : String(configError)}`);
+  }
+
+  if (!pdfjsLib?.getDocument) {
+    throw new Error('PDF.js 加载成功但 getDocument 方法不可用，可能是版本不兼容');
+  }
+
+  try {
+    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(dataBuffer) });
+    const pdf = await loadingTask.promise;
+    return await extractPagesText(pdf);
+  } catch (error: any) {
+    const msg = error?.message || String(error);
+    
+    // Worker 加载失败降级：使用 disableWorker: true 重试
+    if (
+      msg.includes('Setting up fake worker failed') ||
+      msg.includes('Cannot find module') ||
+      msg.includes('pdf.worker') ||
+      msg.includes('worker')
+    ) {
+      console.warn(
+        '[Term Engine] Worker load failed, retrying with disableWorker: true\n' +
+        `  Error: ${msg.substring(0, 200)}`
+      );
+      try {
+        const fallbackTask = pdfjsLib.getDocument({
+          data: new Uint8Array(dataBuffer),
+          disableWorker: true,
+        });
+        const pdf = await fallbackTask.promise;
+        return await extractPagesText(pdf);
+      } catch (fallbackError: any) {
+        const fbMsg = fallbackError?.message || String(fallbackError);
+        throw new Error(`PDF文本提取失败: ${fbMsg}`);
+      }
+    }
+    
+    if (error instanceof Error && error.name === 'PasswordException') {
+      throw new Error('PDF文件已加密，需要密码才能打开');
+    }
+    throw new Error(`PDF文本提取失败: ${msg}`);
+  }
 }
 
 export async function extractTermsFromFile(
@@ -1198,6 +1678,7 @@ export async function extractTermsFromFile(
   
   console.log(`[Term Engine] File exists, reading content...`);
 
+  let pdfBuffer: Buffer | null = null;
   let text = '';
   try {
     if (ext === 'txt' || ext === 'md' || ext === 'json' || ext === 'rtf' || ext === 'xml' || ext === 'doc' || ext === 'xls' || ext === 'xlsx') {
@@ -1211,8 +1692,8 @@ export async function extractTermsFromFile(
       console.log(`[Term Engine] Successfully extracted ${text.length} characters from DOCX`);
     } else if (ext === 'pdf') {
       console.log('[Term Engine] Reading PDF file with pdfjs-dist');
-      const dataBuffer = fs.readFileSync(filePath);
-      text = await extractTextFromPDF(dataBuffer);
+      pdfBuffer = fs.readFileSync(filePath);
+      text = await extractTextFromPDF(pdfBuffer);
       console.log(`[Term Engine] Successfully extracted ${text.length} characters from PDF`);
     } else if (ext === 'html' || ext === 'htm') {
       console.log('[Term Engine] Reading HTML file with content extraction');
@@ -1235,6 +1716,33 @@ export async function extractTermsFromFile(
   } catch (error) {
     console.error(`[Term Engine] Error reading/extracting text from file:`, error);
     throw new Error(`Failed to extract text from file: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // 对于图片型 PDF（提取文本过短），在 AI 模式下回退到 AI Vision 抽取
+  const isPDFWithInsufficientText = ext === 'pdf' && (!text || text.trim().length < 100);
+  
+  if (isPDFWithInsufficientText && useAI && aiConfig?.apiKey) {
+    console.log('[Term Engine] PDF text too short (< 100 chars), falling back to AI Vision extraction');
+    
+    // 检测 canvas 可用性，提前告知用户
+    const canvasDiag = getCanvasDiagnostics();
+    if (!canvasDiag.available) {
+      console.warn(
+        `[Term Engine] ⚠️  PDF 文本提取不足，疑似图片型/扫描型 PDF。\n` +
+        `   Canvas 模块不可用 (${canvasDiag.error})，AI Vision 模式将无法渲染页面图像。\n` +
+        `   建议：安装 Visual Studio C++ Clang 工具链后运行 npm rebuild canvas，\n` +
+        `   或降级 Node.js 到 v20 LTS。`
+      );
+    }
+    
+    try {
+      const terms = await extractTermsFromPDFWithAI(filePath, language, aiConfig);
+      console.log(`[Term Engine] AI Vision extraction returned ${terms.length} terms`);
+      return terms;
+    } catch (aiError) {
+      console.error('[Term Engine] AI Vision extraction failed, falling back to regular text extraction:', aiError);
+      // 回退失败，继续走常规文本抽取
+    }
   }
 
   if (!text || text.trim().length === 0) {
@@ -1316,17 +1824,6 @@ export async function extractTermsFromUrl(
       );
     }
     
-    // 使用增强的HTML内容提取，过滤噪声
-    const extracted = extractHtmlContent(html);
-    let text = extracted.text;
-    console.log(`[Term Engine] Content extraction: ${text.length} chars (from ${html.length} HTML), hasContent: ${extracted.hasContent}`);
-    
-    // 如果内容区提取结果太少，fallback到简单提取
-    if (text.length < 50 && html.length > 1000) {
-      console.log('[Term Engine] Content extraction too short, falling back to simple extraction');
-      text = simpleHtmlToText(html);
-    }
-    
     // 更新进度：HTML解析完成，开始文本提取
     if (progressReporter) {
       progressReporter.updateStage(
@@ -1336,11 +1833,30 @@ export async function extractTermsFromUrl(
       );
     }
     
-    // [改进] 对网页文本执行二次清洗，移除残留的导航/版权/纯数字行
-    const preCleanLength = text.length;
-    text = cleanWebText(text);
-    if (text.length < preCleanLength) {
-      console.log(`[Term Engine] URL text cleaned: ${preCleanLength} → ${text.length} chars`);
+    let text: string;
+    
+    if (useAI && aiConfig) {
+      // [优化] AI路径：使用精简HTML保留结构信息，让AI更准确识别正文/标题/列表
+      text = sanitizeHtmlForAI(html);
+      console.log(`[Term Engine] AI path: using sanitized HTML (${text.length} chars with structure preserved)`);
+    } else {
+      // 规则路径：使用增强的HTML内容提取，过滤噪声
+      const extracted = extractHtmlContent(html);
+      text = extracted.text;
+      console.log(`[Term Engine] Rules path: content extraction ${text.length} chars (from ${html.length} HTML), hasContent: ${extracted.hasContent}`);
+      
+      // 如果内容区提取结果太少，fallback到简单提取
+      if (text.length < 50 && html.length > 1000) {
+        console.log('[Term Engine] Content extraction too short, falling back to simple extraction');
+        text = simpleHtmlToText(html);
+      }
+      
+      // [改进] 对网页文本执行二次清洗，移除残留的导航/版权/纯数字行
+      const preCleanLength = text.length;
+      text = cleanWebText(text);
+      if (text.length < preCleanLength) {
+        console.log(`[Term Engine] URL text cleaned: ${preCleanLength} → ${text.length} chars`);
+      }
     }
     
     // 调用文本提取函数
@@ -1351,6 +1867,189 @@ export async function extractTermsFromUrl(
     }
     throw new Error('网页抽取失败: ' + (error instanceof Error ? error.message : String(error)));
   }
+}
+
+/**
+ * 增强版URL抽取 —— 同时返回术语列表和抽取元数据
+ * 调用方可通过 metadata.fallbackReason 判断AI是否降级，并在UI上提示用户
+ */
+export async function extractTermsFromUrlWithMeta(
+  url: string,
+  language: 'en' | 'zh' | 'auto' = 'auto',
+  useAI = false,
+  aiConfig?: AIConfig,
+  progressReporter?: ProgressReporter
+): Promise<{ terms: ExtractedTerm[]; metadata: ExtractionMetadata }> {
+  try {
+    if (progressReporter) {
+      progressReporter.updateStage(
+        ProgressStages.FETCHING,
+        defaultProgressEstimator.calculateSubProgress(ProgressStages.FETCHING, 10),
+        '开始网页抓取...'
+      );
+    }
+    
+    const result = await smartWebFetch({
+      url,
+      timeout: 45000,
+      retryCount: 3,
+      forceJavaScript: url.includes('mp.weixin.qq.com') || url.includes('weixin.qq.com'),
+      fallbackToSimple: true,
+    });
+    
+    if (!result.success) {
+      throw new Error(result.error || '网页抓取失败');
+    }
+    
+    const html = result.html;
+    console.log(`[Term Engine] Successfully extracted ${html.length} chars from URL: ${url}`);
+    
+    if (progressReporter) {
+      progressReporter.updateStage(
+        ProgressStages.HTML_PARSING,
+        defaultProgressEstimator.calculateSubProgress(ProgressStages.HTML_PARSING, 0),
+        '解析HTML内容...'
+      );
+    }
+    
+    // [优化] AI路径优先：使用精简HTML保留结构信息
+    let text: string;
+    if (useAI && aiConfig) {
+      text = sanitizeHtmlForAI(html);
+      console.log(`[Term Engine] AI path (withMeta): using sanitized HTML (${text.length} chars with structure preserved)`);
+    } else {
+      const extracted = extractHtmlContent(html);
+      text = extracted.text;
+      console.log(`[Term Engine] Rules path (withMeta): content extraction ${text.length} chars (from ${html.length} HTML), hasContent: ${extracted.hasContent}`);
+      
+      if (text.length < 50 && html.length > 1000) {
+        console.log('[Term Engine] Content extraction too short, falling back to simple extraction');
+        text = simpleHtmlToText(html);
+      }
+      
+      const preCleanLength = text.length;
+      text = cleanWebText(text);
+      if (text.length < preCleanLength) {
+        console.log(`[Term Engine] URL text cleaned: ${preCleanLength} → ${text.length} chars`);
+      }
+    }
+    
+    if (progressReporter) {
+      progressReporter.updateStage(
+        ProgressStages.TEXT_EXTRACTION,
+        defaultProgressEstimator.calculateSubProgress(ProgressStages.TEXT_EXTRACTION, 0),
+        '提取文本内容...'
+      );
+    }
+    
+    // [P1增强] 检测双语表格/列表结构，用于双语网站的结构化抽取
+    const bilingualPairs = extractBilingualTableRows(html);
+    if (bilingualPairs.length >= 3) {
+      console.log(`[Term Engine] Detected ${bilingualPairs.length} bilingual row pairs from HTML tables/lists`);
+      const bilingualText = formatBilingualPairsForExtraction(bilingualPairs);
+      console.log(`[Term Engine] Formatted bilingual text: ${bilingualText.length} chars, first 200: ${bilingualText.substring(0, 200)}`);
+      
+      // 将双语格式化文本通过标准抽取管线处理（保留AI/规则路径）
+      // 格式化后的双语文本每行都是 "中文 | 英文"，AI和规则都能更好地处理
+      const bilingualResult = await extractTermsFromTextWithMeta(bilingualText, 'auto', useAI, aiConfig);
+      console.log(`[Term Engine] Bilingual extraction: ${bilingualResult.terms.length} terms, mode: ${bilingualResult.metadata.mode}`);
+      
+      // 修正元数据标记为双语来源
+      bilingualResult.metadata.mode = bilingualResult.metadata.mode === 'ai-only' ? 'ai-bilingual' :
+                                       bilingualResult.metadata.mode === 'ai-degraded-to-rules' ? 'bilingual-rules' :
+                                       'bilingual-rules';
+      return bilingualResult;
+    }
+    
+    // 调用带元数据的文本提取
+    return extractTermsFromTextWithMeta(text, language, useAI, aiConfig);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('请求超时，网站响应过慢或无法访问。');
+    }
+    throw new Error('网页抽取失败: ' + (error instanceof Error ? error.message : String(error)));
+  }
+}
+
+/**
+ * 增强版文件抽取 —— 同时返回术语列表和抽取元数据
+ * 调用方可通过 metadata.fallbackReason 判断AI是否降级，并在UI上提示用户
+ */
+export async function extractTermsFromFileWithMeta(
+  filePath: string,
+  language: 'en' | 'zh' | 'auto' = 'auto',
+  useAI = false,
+  aiConfig?: AIConfig,
+  _sourceType?: string
+): Promise<{ terms: ExtractedTerm[]; metadata: ExtractionMetadata }> {
+  console.log(`[Term Engine] extractTermsFromFileWithMeta called: ${filePath}, language: ${language}, useAI: ${useAI}`);
+  
+  const ext = filePath.split('.').pop()?.toLowerCase();
+  console.log(`[Term Engine] File extension: ${ext}`);
+  
+  if (!ext) {
+    throw new Error('Invalid file path: cannot determine file type');
+  }
+  
+  if (!fs.existsSync(filePath)) {
+    throw new Error('Invalid file path: file not found');
+  }
+  
+  let text = '';
+  try {
+    if (ext === 'txt' || ext === 'md' || ext === 'json' || ext === 'rtf' || ext === 'xml' || ext === 'doc' || ext === 'xls' || ext === 'xlsx') {
+      text = fs.readFileSync(filePath, 'utf-8');
+    } else if (ext === 'docx') {
+      const result = await mammoth.extractRawText({ path: filePath });
+      text = result.value;
+    } else if (ext === 'pdf') {
+      const dataBuffer = fs.readFileSync(filePath);
+      text = await extractTextFromPDF(dataBuffer);
+    } else if (ext === 'html' || ext === 'htm') {
+      const html = fs.readFileSync(filePath, 'utf-8');
+      const extracted = extractHtmlContent(html);
+      text = extracted.text;
+      if (text.length < 50 && html.length > 1000) {
+        text = simpleHtmlToText(html);
+      }
+    } else {
+      throw new Error('Unsupported file type for extraction: ' + ext);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('Unsupported file type')) {
+      throw error;
+    }
+    console.error(`[Term Engine] Error reading file ${filePath}:`, error);
+    throw new Error('文件读取失败: ' + (error instanceof Error ? error.message : String(error)));
+  }
+  
+  console.log(`[Term Engine] Successfully extracted ${text.length} characters`);
+  
+  // 对于图片型 PDF（提取文本过短），在 AI 模式下回退到 AI Vision 抽取
+  if (text.length < 100) {
+    const isPDF = ext === 'pdf';
+    if (isPDF && useAI && aiConfig?.apiKey) {
+      console.log('[Term Engine] withMeta: PDF text too short (< 100 chars), falling back to AI Vision extraction');
+      try {
+        const terms = await extractTermsFromPDFWithAI(filePath, language, aiConfig);
+        console.log(`[Term Engine] withMeta: AI Vision extraction returned ${terms.length} terms`);
+        return {
+          terms,
+          metadata: {
+            mode: 'ai-only',
+            extractionMethod: 'ai-vision',
+          } as ExtractionMetadata,
+        };
+      } catch (aiError) {
+        console.error('[Term Engine] withMeta: AI Vision extraction failed, falling back:', aiError);
+        return { terms: [], metadata: { mode: 'rules-only', fallbackReason: `AI Vision抽取失败: ${aiError instanceof Error ? aiError.message : String(aiError)}` } as ExtractionMetadata };
+      }
+    }
+    console.warn('[Term Engine] WARNING: Very short text extracted, likely low-quality');
+    return { terms: [], metadata: { mode: 'rules-only', fallbackReason: '文件内容过短，无法提取有效术语' } as ExtractionMetadata };
+  }
+  
+  return extractTermsFromTextWithMeta(text, language, useAI, aiConfig);
 }
 
 /**
@@ -1406,6 +2105,29 @@ export async function smartExtractTermsFromFile(
     throw new Error('Unsupported file type for extraction: ' + ext);
   }
 
+  // 对于图片型 PDF（提取文本过短），在 AI 模式下回退到 AI Vision 抽取
+  const isPDFWithInsufficientText = ext === 'pdf' && (!text || text.trim().length < 100);
+  const hasAIStrategy = (strategy.mode === 'ai-only' || strategy.mode === 'hybrid') && strategy.aiConfig?.apiKey;
+  
+  if (isPDFWithInsufficientText && hasAIStrategy) {
+    console.log('[Term Engine] smart: PDF text too short (< 100 chars), falling back to AI Vision extraction');
+    try {
+      const visionTerms = await extractTermsFromPDFViaAI(filePath, language, strategy.aiConfig!);
+      console.log(`[Term Engine] smart: AI Vision extraction returned ${visionTerms.length} terms`);
+      // 将 ExtractedTerm[] 转为 SmartExtractionResult[]
+      const results: SmartExtractionResult[] = visionTerms.map(t => ({
+        ...t,
+        confidence: t.translation_confidence ?? 0.8,
+        isExistingTerm: false,
+        translationValue: Math.round(t.score),
+      } as SmartExtractionResult));
+      return results;
+    } catch (aiError) {
+      console.error('[Term Engine] smart: AI Vision extraction failed, falling back to regular text extraction:', aiError);
+      // 回退失败，继续走常规文本抽取
+    }
+  }
+
   return smartExtractTerms(text, language, strategy);
 }
 
@@ -1434,14 +2156,22 @@ export async function smartExtractTermsFromUrl(
     const html = result.html;
     console.log(`[Term Engine] smartExtractTermsFromUrl: ${html.length} chars from ${url}`);
     
-    // 使用增强的HTML内容提取
-    const extracted = extractHtmlContent(html);
-    let text = extracted.text;
-    console.log(`[Term Engine] Content extraction: ${text.length} chars, hasContent: ${extracted.hasContent}`);
+    let text: string;
     
-    // Fallback到简单提取
-    if (text.length < 50 && html.length > 1000) {
-      text = simpleHtmlToText(html);
+    // [优化] AI模式：使用精简HTML保留结构信息（h1-h6/li/table等标签），让AI更准确识别正文
+    if (strategy.mode === 'ai-only' && strategy.aiConfig) {
+      text = sanitizeHtmlForAI(html);
+      console.log(`[Term Engine] smart AI path: using sanitized HTML (${text.length} chars with structure preserved)`);
+    } else {
+      // 规则路径：使用增强的HTML内容提取
+      const extracted = extractHtmlContent(html);
+      text = extracted.text;
+      console.log(`[Term Engine] smart rules path: content extraction ${text.length} chars, hasContent: ${extracted.hasContent}`);
+      
+      // Fallback到简单提取
+      if (text.length < 50 && html.length > 1000) {
+        text = simpleHtmlToText(html);
+      }
     }
     
     return smartExtractTerms(text, language, strategy);

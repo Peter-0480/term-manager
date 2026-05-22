@@ -3,6 +3,7 @@
  */
 
 import { ExtractedTerm } from './index';
+import { isNoiseTerm } from './ai-extractor';
 import { getTerms, getDomains } from '../database';
 import { AIConfig, getFullEndpoint, validateAIConfig } from '../ai-client';
 import { globalRequestMerger } from '../api-cache-manager';
@@ -294,8 +295,54 @@ async function performAIExtraction(
       allAiTerms = aiTerms;
     }
     
-    // ========== [方案B] 概念首倡语言后处理校验 ==========
-    allAiTerms = allAiTerms.map(term => postCheckSourceLanguage(term));
+    // ========== AI增强模式与规则模式的噪声过滤 ==========
+    // ★ ai-only 模式下也必须运行JSON字段名噪声过滤，否则字段名会泄露为术语
+    // 但跳过其他规则噪声（如通用词过滤），保持AI自主筛选的完整性
+    {
+      const beforeNoiseFilter = allAiTerms.length;
+      
+      // 核心噪声过滤：永远运行（包括 ai-only），防止JSON字段名泄露
+      allAiTerms = allAiTerms.filter(term => !isNoiseTerm(term.term_text));
+      if (beforeNoiseFilter !== allAiTerms.length) {
+        console.log(`[Smart Extractor] Noise filter removed ${beforeNoiseFilter - allAiTerms.length} terms (JSON field names, etc.)`);
+      }
+      
+      // [新增] 附加过滤：检测AI误将字段名作为独立对象输出的情况
+      // 当term_text本身就是一个JSON schema字段名时（如 "source_term", "target_lang" 等），直接排除
+      const jsonFieldNames = new Set([
+        'source_term', 'source_lang', 'target_term', 'target_lang',
+        'translation_source', 'translation_confidence', 'source_confidence',
+        'abbreviation_suggestion', 'abbreviation', 'term_text', 'score',
+        'translation', 'source', 'target', 'name', 'word', 'text',
+      ]);
+      const beforeFieldNameFilter = allAiTerms.length;
+      allAiTerms = allAiTerms.filter(term => {
+        const cleaned = String(term.term_text || '').replace(/^["']+|["']+$/g, '').trim().toLowerCase();
+        if (jsonFieldNames.has(cleaned)) {
+          console.log(`[Smart Extractor] Filtered out JSON field name: "${term.term_text}"`);
+          return false;
+        }
+        return true;
+      });
+      if (beforeFieldNameFilter !== allAiTerms.length) {
+        console.log(`[Smart Extractor] Field name filter removed ${beforeFieldNameFilter - allAiTerms.length} terms`);
+      }
+      
+      // [新增] 过滤source_confidence / translation_confidence等以数字为term_text的条目
+      allAiTerms = allAiTerms.filter(term => {
+        const text = String(term.term_text || '').trim();
+        if (/^[\d.]+[,;\s]*$/.test(text)) {
+          console.log(`[Smart Extractor] Filtered out numeric-only term: "${text}"`);
+          return false;
+        }
+        return true;
+      });
+      
+      if (strategy.mode !== 'ai-only') {
+        // 非ai-only模式：额外运行概念首倡语言后处理
+        allAiTerms = allAiTerms.map(term => postCheckSourceLanguage(term));
+      }
+    }
     
     // [已移除] 非"含中文"语对过滤 - 不再强制过滤，由用户自行筛选
     
@@ -357,7 +404,7 @@ function buildExtractionPrompt(
   _language: string,
   existingTerms: string[],
   domainInfo: any,
-  _strategy: ExtractionStrategy,
+  strategy: ExtractionStrategy,
   isBilingual: boolean = false,
   detectedLangs: string = ''
 ): string {
@@ -368,7 +415,45 @@ function buildExtractionPrompt(
     ? `\n【多语识别信息】检测到文本包含多种语言：${detectedLangs}。请先分析文本中的语言对和对照关系，再抽取术语。`
     : '';
 
+  // [新增] 动态外文语种推断，用于指导AI输出正确的 target_lang
+  const foreignLangHint = detectedLangs
+    ? (() => {
+        const frMatch = detectedLangs.match(/fr/i);
+        const deMatch = detectedLangs.match(/de/i);
+        const esMatch = detectedLangs.match(/es/i);
+        const itMatch = detectedLangs.match(/it/i);
+        const ptMatch = detectedLangs.match(/pt/i);
+        const jaMatch = detectedLangs.match(/ja/i);
+        const koMatch = detectedLangs.match(/ko/i);
+        const ruMatch = detectedLangs.match(/ru/i);
+        const arMatch = detectedLangs.match(/ar/i);
+        const enMatch = detectedLangs.match(/en/i);
+        if (frMatch) return 'fr（法语）';
+        if (deMatch) return 'de（德语）';
+        if (esMatch) return 'es（西班牙语）';
+        if (itMatch) return 'it（意大利语）';
+        if (ptMatch) return 'pt（葡萄牙语）';
+        if (jaMatch) return 'ja（日语）';
+        if (koMatch) return 'ko（韩语）';
+        if (ruMatch) return 'ru（俄语）';
+        if (arMatch) return 'ar（阿拉伯语）';
+        if (enMatch) return 'en（英语）';
+        return 'en（英语）';
+      })()
+    : 'en（英语）';
+
+  // [修改] 所有模式下统一使用AI自主判断，不再提供机械的通用词剔除列表
+  const valueFilterSection = strategy.mode === 'rules-only'
+    ? `以下类型的内容即使符合"意义完整"也应当剔除（翻译价值低）：
+1. 日常高频通用词：数据、使用、应用、系统、方法、方式、管理、发展、研究、建设、水平、工作、问题、情况、过程、条件、因素、结果、影响、关系、结构、时间、空间、资源、信息、知识、技术、服务、产品、用户、企业、公司、部门、项目、任务、要求、标准、规定、制度、政策、措施、方案、建议、意见、基本、主要、重要、相关、具体
+2. 日常高频英文通用词：data, system, method, process, result, analysis, application, development, management, research, technology, service, product, project, information, solution, approach, requirement, standard, policy, strategy, framework`
+    : `你需要自主判断每个候选词的术语价值，而非机械套用通用词列表。
+请根据上下文、领域特性和专业深度来判断：该词是否具有不可替代的专业含义？是否超出一般水平译者能力？是否在特定领域有独特用法？
+对于在专业语境下具有明确术语职能的词（即使表面看起来是"通用词"），也应保留并赋予高 scores。`;
+
   return `你是一位为中文母语译者服务的多语术语抽取专家。你的任务是：从下文文本中识别并抽取那些对中文母语译者真正有翻译价值的术语。
+
+**检测到的外文语种：${foreignLangHint}**（中文术语的目标译文语言应优先使用此语种）
 
 ═══════════════════════════════════════════
 【第〇步：格式预检（优先于文本类型分析）】
@@ -377,14 +462,18 @@ function buildExtractionPrompt(
 - 文本以编号（如 01./1./① / (1)）或项目符号（如 • / ● / － / ▸）开头
 - 每行结构为：编号+中文+英文（或编号+英文+中文），中英文之间以空格或分隔符隔开
 - 连续多行（≥5行）保持同一格式
-- 典型样例：
-  "01. 计划生育 family planning"
-  "• 可持续发展 — sustainable development"
-  "● 社会主义核心价值观   Core Socialist Values"
-  "1) data privacy 数据隐私"
+ - 典型样例：
+   "01. 计划生育 family planning"
+   "• 可持续发展 — sustainable development"
+   "● 社会主义核心价值观   Core Socialist Values"
+   "1) data privacy 数据隐私"
+ - ★重要：PDF提取可能损失空格，导致紧凑格式如：
+   "1商标trademark"（数字+中文+英文连续无空格）
+   "2注册商标registeredtrademark"
+   这类格式仍然是双语词汇表，不要因缺少空格和分隔符而忽视。每行核心结构为"数字+中文术语+英文术语"。
 
-如果匹配上述格式，直接判定为「类型E - 双语词汇表」，跳过后续文本类型分析的优先级判断。
-如果输入文本完全不符合词汇表格式，则继续执行第一步的文本类型分析。
+ 如果匹配上述格式，直接判定为「类型E - 双语词汇表」，跳过后续文本类型分析的优先级判断。
+ 如果输入文本完全不符合词汇表格式，则继续执行第一步的文本类型分析。
 
 ═══════════════════════════════════════════
 【第一步：文本类型分析（强制执行）】
@@ -399,10 +488,9 @@ function buildExtractionPrompt(
   → 禁止为单语文本编造任何翻译。
 
 类型B - 主体语种+其他语种注释/嵌套：
-  文本以一种语言为主体，但零散嵌入了少量其他语言的单词、短语或注释（如中文文章中夹杂英文术语/缩写）。
-  → 抽取策略：仅抽取主体语种的术语原文（source_term）。
-  → 对于嵌入的外语词汇，如果它们是该领域公认的专业术语且以原文形式呈现，可以将其作为该外语的独立术语抽取。
-  → 不为嵌套的外语词汇编造对译，也不为主体语种术语编造翻译。
+  文本以一种语言为主体，但零散嵌入了少量其他语言的单词、短语或注释。
+  → ★关键区分·括号标注子类型：如果外文以括号标注形式紧跟在中文术语后面（如"相互性（mutuality）""争点排除（issue preclusion）"），则括号内外互为精准译文，必须识别并建立双向对译关系。每个括号对对应输出两个条目（zh→外文 + 外文→zh），target_term和target_lang均不可为null，translation_source="file"，translation_confidence=0.95~1.0。
+  → 非括号标注：如果外文不是括号标注（如"这篇文章讲的是AI技术在legal translation中的应用"），则仅抽取主体语种术语原文，不为嵌入的外语词汇编造对译。
 
 类型C - 双语或多语对照文本：
   文本以两种或多种语言对照形式呈现（如中英文对照的法律条文、逐段对照的技术文档）。
@@ -429,7 +517,7 @@ function buildExtractionPrompt(
 ═══ 判断优先级：
 1. 如果第〇步格式预检判定为词汇表格式 → 类型E（最高优先级，直接判定）
 2. 如果全文仅有一种语言 → 类型A
-3. 如果有主体语种（占70%以上字符）夹杂少量其他语言 → 类型B
+3. 如果有主体语种（占70%以上字符）夹杂少量其他语言，且其他语言以括号标注形式出现 → 类型B（括号标注子类型），必须识别括号内外的对译关系
 4. 如果有两种及以上语言以段落/句子级对照出现 → 类型C
 5. 其他多语混合情况 → 类型D
 
@@ -452,12 +540,7 @@ function buildExtractionPrompt(
 ⚠ 类型E特殊豁免：如果当前文本被判定为「类型E - 双语词汇表」，则跳过下述剔除规则。
   词汇表中的所有条目都是经过筛选的专业术语，默认具有翻译价值，不应用通用词剔除。
 
-以下类型的内容即使符合"意义完整"也应当剔除（翻译价值低）：
-1. 日常高频通用词：数据、使用、应用、系统、方法、方式、管理、发展、研究、建设、水平、工作、问题、情况、过程、条件、因素、结果、影响、关系、结构、时间、空间、资源、信息、知识、技术、服务、产品、用户、企业、公司、部门、项目、任务、要求、标准、规定、制度、政策、措施、方案、建议、意见、基本、主要、重要、相关、具体
-2. 日常高频英文通用词：data, system, method, process, result, analysis, application, development, management, research, technology, service, product, project, information, solution, approach, requirement, standard, policy, strategy, framework
-3. 常见表述套话：具有重要意义、进一步加强、持续优化、积极推进、全面落实
-4. 无需翻译知识即可直译的普通复合词（如"经济发展""社会进步""环境保护"——除非出现在高度专业的法律/技术语境且译法有特殊性）
-5. 任何连续普通单词拼接成的无专业意义的词组
+${valueFilterSection}
 
 以下类型的术语翻译价值高，应优先抽取：
 1. 专业领域概念：法律术语（如"诉讼时效""管辖权异议""先予执行"）、医学术语（如"糖皮质激素""细胞凋亡"）、金融术语（如"量化宽松""信用违约互换"）
@@ -468,9 +551,9 @@ function buildExtractionPrompt(
 6. 跨语言长难术语：需要转义才能准确翻译的复合结构
 
 ═══════════════════════════════════════════
-【第四步：原文-译文方向判定规则（仅类型C适用）】
+【第四步：原文-译文方向判定规则（类型C 及 类型B括号标注子类型适用）】
 ═══════════════════════════════════════════
-对于双语/多语对照文本（类型C），你必须根据"概念首倡语言"来判定 source_lang，而非根据文本表面的书写语言。
+对于双语/多语对照文本（类型C）及主体语种+括号注释文本（类型B括号标注子类型），你必须根据"概念首倡语言"来判定 source_lang，而非根据文本表面的书写语言。
 - 判断依据：该概念/术语最早是在哪个语言范畴中产生和定义的。
 - 典型示例：
   ▶ "Artificial Intelligence" → source_lang = "en"，因为AI概念首先在英语世界提出和定义。
@@ -479,6 +562,9 @@ function buildExtractionPrompt(
   ▶ "武士道" → source_lang = "ja"（源于日本文化）
   ▶ "区块链" → source_lang = "en"（blockchain，概念首先在英语世界提出）
 
+- ★ 对于类型B括号标注子类型（如"相互性（mutuality）""争点排除（issue preclusion）"），每个括号对应生成两个条目：
+  * 条目一：中文为 source_term（source_lang="zh"），括号内外文为 target_term（target_lang 为对应外文语种），translation_source="file"，translation_confidence=0.95~1.0
+  * 条目二：外文为 source_term（source_lang 为对应外文语种），括号外中文为 target_term（target_lang="zh"），translation_source="file"，translation_confidence=0.95~1.0
 - source_confidence 是你的判断把握度（0-1）。
 
 ═══════════════════════════════════════════
@@ -499,7 +585,7 @@ function buildExtractionPrompt(
 {
   "source_term": "源术语文本（必须是有专业价值的完整术语）",
   "source_lang": "zh|en|fr|ja|es|de|ru|ar|ko|it|pt",
-  "target_term": "目标术语文本 或 null（类型A/B时全部为null，类型C/D仅在存在对译关系时填写）",
+  "target_term": "目标术语文本 或 null（类型A时全部为null；类型B括号标注子类型时括号内文本即为target_term，不可为null；非括号标注的类型B和类型C/D仅在存在对译关系时填写）",
   "target_lang": "zh|en|fr|ja|es|de|ru|ar|ko|it|pt 或 null",
   "translation_source": "file|none",
   "translation_confidence": 0.0-1.0,
@@ -516,7 +602,30 @@ ${existingTermsSample ? `现有术语示例：${existingTermsSample} —— 如�
 ═══════════════════════════════════════════
 ${text}${text.length > 100000 ? `\n\n（输入文本共${text.length}字符，已截断至前100000字符。）` : ''}
 
-只返回纯JSON数组，不要包含任何解释文字、markdown代码块标记或其他文本。`;
+只返回纯JSON数组，不要包含任何解释文字、markdown代码块标记或其他文本。
+
+═══════════════════════════════════════════
+【★重要兜底规则】
+═══════════════════════════════════════════
+即使你认为文本中没有明显的专业术语，也必须至少返回文本中出现的所有以下类型条目：
+1. 专有名词（人名、地名、机构名、品牌名、项目名）
+2. 带引号或特殊标记的词组
+3. 任何被编号或列表化的条目
+4. 所有缩写（含全大写字母组合）
+5. 任何看起来像一个"概念"或"事物名称"的词组
+6. 文本中出现的外语词汇（对中文母语者而言可能是陌生的外来语）
+绝不返回空数组[]。如果确实无法识别任何术语，至少将文本中前3个最像术语的名词短语作为结果返回。
+
+═══════════════════════════════════════════
+【★关键禁止项——绝对不要输出以下内容作为术语】
+═══════════════════════════════════════════
+以下内容绝对禁止出现在 term_text 字段中：
+1. 本 Prompt 中出现的 JSON Schema 字段名（如 "source_term"、"source_lang"、"target_term"、"target_lang"、"translation_source"、"translation_confidence"、"source_confidence"、"abbreviation_suggestion" 等）——这些仅是说明输出格式的元数据键名，不是术语内容
+2. 任何编程语言关键字、代码标识符、配置项名称
+3. 纯标点符号、纯数字、或长度不足 2 个字符的片段
+4. 任何看起来像英文 JSON key 或 snake_case 标识符的文本（如 "source_lang"、"target_term"、"translation_confidence"）
+5. 任何带引号包裹的字段名（如 '"source_lang"'、'"target_term"'）
+如果你不确定某段文本是否是术语，请检查它是否在上述禁止列表中。如果是，必须排除，不要输出。`;
 }
 
 /**
@@ -702,7 +811,28 @@ async function callAITermExtraction(
         // abbreviation_suggestion 应该为空（null）或者有实际意义的缩写
         // 如果缩写是源术语的首字母提取且长度 ≤ 5 且与源术语无构成关系，清除
         let finalAbbr = item.abbreviation_suggestion ? String(item.abbreviation_suggestion).trim() : undefined;
-        const sourceText = String(item.source_term || item.term_text || '').trim();
+        
+        // ===== [方案D] 字段名容错：兼容多种AI返回的字段名称 =====
+        // AI可能返回不同的字段名（如 source/name 而非 source_term，translation 而非 target_term 等）
+        const sourceText = String(
+          item.source_term || item.term_text || item.source || item.term || item.name || item.word || item.text || ''
+        ).trim();
+        
+        // 如果 target_term 未通过标准字段名获取到，尝试备用字段名
+        if (!finalTargetTerm) {
+          const altTarget = item.target_term || item.translation || item.target || item.target_text || item.translated || '';
+          if (altTarget && String(altTarget).trim()) {
+            finalTargetTerm = String(altTarget).trim();
+            console.log(`[AI Extraction] Recovered target_term from alternate field: "${finalTargetTerm}" for "${sourceText}"`);
+          }
+        }
+        
+        // 如果 target_lang 未设置且 target_term 存在，推断目标语言
+        if (!finalTargetLang && finalTargetTerm) {
+          const zhInTarget = (finalTargetTerm.match(/[\u4e00-\u9fa5]/g) || []).length;
+          finalTargetLang = zhInTarget >= 2 ? 'zh' : 'en';
+          console.log(`[AI Extraction] Inferred target_lang="${finalTargetLang}" for target_term "${finalTargetTerm}"`);
+        }
         
         if (finalAbbr && sourceText.length > 0) {
           const words = sourceText.split(/\s+/).filter((w: string) => w.length > 0);
@@ -722,8 +852,8 @@ async function callAITermExtraction(
         }
         
         return {
-          term_text: String(item.source_term || item.term_text || '').trim(),
-          source_term: String(item.source_term || item.term_text || '').trim(),
+          term_text: sourceText,
+          source_term: sourceText,
           source_lang: sourceLang,
           target_term: finalTargetTerm,
           target_lang: finalTargetLang,
@@ -745,7 +875,9 @@ async function callAITermExtraction(
       });
       
       if (terms.length === 0) {
-        console.warn('解析后的术语列表为空，原始响应:', content.substring(0, 300));
+        const promptPreview = prompt ? prompt.substring(Math.max(0, prompt.indexOf('【待抽取文本】') + 30), Math.max(0, prompt.indexOf('【待抽取文本】') + 30) + 500).trim() : '(no prompt)';
+        console.warn('解析后的术语列表为空，原始响应:', content.substring(0, 500));
+        console.warn('提交文本预览（待抽取文本部分前500字符）:', promptPreview.replace(/\n/g, '\\n'));
         if (parsed.length > 0) {
           console.warn('第一个条目的字段:', Object.keys(parsed[0]));
           console.warn('第一个条目的值:', parsed[0]);
@@ -969,25 +1101,16 @@ export async function extractWithHybrid(
     return extractWithRules(text, language, strategy);
   }
   
-  // [改进] 仅保留最小长度和置信度过滤，移除过度激进的 translationValue 过滤
+  // [修改] 移除置信度过滤和 translationValue 排序，保留AI自主判断的所有结果
   const filteredResults = aiResults.filter(term => {
     if (term.term_text.length < strategy.minTermLength) return false;
     if (term.term_text.length > strategy.maxTermLength) return false;
-    if (term.confidence < 0.15) return false;  // 降低阈值：0.25 → 0.15
+    // 不再过滤置信度，让AI的自主判断完全决定结果
     return true;
   });
   
-  filteredResults.sort((a, b) => {
-    const valueDiff = b.translationValue - a.translationValue;
-    if (Math.abs(valueDiff) > 1) return valueDiff;
-    return b.confidence - a.confidence;
-  });
-  
-  // [改进] 如果过滤后结果仍然为0但AI有返回结果，保留AI所有结果
-  if (filteredResults.length === 0 && aiResults.length > 0) {
-    console.log(`[Smart Extractor] All ${aiResults.length} AI terms filtered out, returning all AI results to avoid empty output`);
-    return aiResults.sort((a, b) => b.confidence - a.confidence).slice(0, strategy.maxResults || 300);
-  }
+  // 按AI返回的原始顺序 + 去重，不再依赖 translationValue 排序
+  filteredResults.sort((a, b) => b.confidence - a.confidence);
   
   console.log(`[Smart Extractor] Hybrid extraction completed, ${filteredResults.length} terms (AI: ${aiResults.length}, after filter: ${filteredResults.length})`);
   return filteredResults;
@@ -1031,7 +1154,36 @@ function buildSystemInstruction(
     ? `\n【多语识别信息】检测到文本包含多种语言：${detectedLangs}。请先分析文本中的语言对和对照关系，再抽取术语。`
     : '';
 
+  // [新增] 动态外文语种推断
+  const foreignLangHint = detectedLangs
+    ? (() => {
+        const frMatch = detectedLangs.match(/fr/i);
+        const deMatch = detectedLangs.match(/de/i);
+        const esMatch = detectedLangs.match(/es/i);
+        const itMatch = detectedLangs.match(/it/i);
+        const ptMatch = detectedLangs.match(/pt/i);
+        const jaMatch = detectedLangs.match(/ja/i);
+        const koMatch = detectedLangs.match(/ko/i);
+        const ruMatch = detectedLangs.match(/ru/i);
+        const arMatch = detectedLangs.match(/ar/i);
+        const enMatch = detectedLangs.match(/en/i);
+        if (frMatch) return 'fr（法语）';
+        if (deMatch) return 'de（德语）';
+        if (esMatch) return 'es（西班牙语）';
+        if (itMatch) return 'it（意大利语）';
+        if (ptMatch) return 'pt（葡萄牙语）';
+        if (jaMatch) return 'ja（日语）';
+        if (koMatch) return 'ko（韩语）';
+        if (ruMatch) return 'ru（俄语）';
+        if (arMatch) return 'ar（阿拉伯语）';
+        if (enMatch) return 'en（英语）';
+        return 'en（英语）';
+      })()
+    : 'en（英语）';
+
   return `你是一位为中文母语译者服务的多语术语抽取专家。你的任务是：从下文文本中识别并抽取那些对中文母语译者真正有翻译价值的术语。
+
+**检测到的外文语种：${foreignLangHint}**（中文术语的目标译文语言应优先使用此语种）
 
 ═══════════════════════════════════════════
 【第〇步：格式预检（优先于文本类型分析）】
@@ -1039,17 +1191,21 @@ function buildSystemInstruction(
 在执行文本类型分析之前，先检查文本是否呈现"双语词汇表/术语对照列表"格式：
 - 每行结构为：编号+中文+英文（或编号+英文+中文），中英文之间以空格或分隔符隔开
 - 连续多行（≥5行）保持同一格式
-- 典型样例：
-  "01. 计划生育 family planning"  /  "• 可持续发展 — sustainable development"
-  "● 社会主义核心价值观   Core Socialist Values"  /  "1) data privacy 数据隐私"
-如果匹配上述格式，直接判定为「类型E - 双语词汇表」，跳过后续文本类型分析。
+ - 典型样例：
+   "01. 计划生育 family planning"  /  "• 可持续发展 — sustainable development"
+   "● 社会主义核心价值观   Core Socialist Values"  /  "1) data privacy 数据隐私"
+ - ★重要：PDF提取可能损失空格，导致紧凑格式如：
+   "1商标trademark"（数字+中文+英文连续无空格）
+   "2注册商标registeredtrademark"
+   这类格式仍然是双语词汇表，不要因缺少空格和分隔符而忽视。每行核心结构为"数字+中文术语+英文术语"。
+ 如果匹配上述格式，直接判定为「类型E - 双语词汇表」，跳过后续文本类型分析。
 
 ═══════════════════════════════════════════
 【第一步：文本类型分析（强制执行）】
 ═══════════════════════════════════════════
 在抽取任何术语之前，你必须先判断文本属于以下哪种类型：
 类型A - 单一语种文本 → 仅抽取该语种术语原文，target_term=null，translation_source="none"
-类型B - 主体语种+其他语种注释/嵌套 → 仅抽取主体语种术语原文
+类型B - 主体语种+其他语种注释/嵌套 → 如果注释是括号标注格式（如"争点排除（issue preclusion）"），括号内外互为精准译文，必须建立双向对译关系，target_term和target_lang均不可为null；否则仅抽取主体语种术语原文
 类型C - 双语或多语对照文本 → 识别对译关系，返回原文+译文
 类型D - 多语杂合文本 → 分别按各语种抽取术语原文，仅在明确对译时填写target_term
 类型E - 双语词汇表/术语对照列表 → 每行识别为一个术语对，中文→source_term，英文→target_term
@@ -1059,7 +1215,7 @@ function buildSystemInstruction(
 ═══ 判断优先级：
 1. 格式预检判定为词汇表格式 → 类型E（最高优先级）
 2. 全文仅一种语言 → 类型A
-3. 主体语种（≥70%字符）夹杂少量其他语言 → 类型B
+3. 主体语种（≥70%字符）夹杂少量其他语言，且其他语言以括号标注形式出现 → 类型B（括号标注子类型），必须识别括号内外的对译关系
 4. 两种及以上语言段落/句子级对照 → 类型C
 5. 其他 → 类型D
 
@@ -1072,15 +1228,18 @@ function buildSystemInstruction(
 错误：「terms from file source」「identify and score these」
 
 ═══════════════════════════════════════════
-【第三步：价值维度】
+【第三步：价值维度 · AI自主判断】
 ═══════════════════════════════════════════
-剔除通用词（data, system, 数据, 管理...）、套话、连续普通单词拼接词组。
-优先抽取专业领域概念、文化负载词、多义歧义术语、新兴概念、缩写。
+你拥有完全的自主判断权。根据你的语言知识和领域认知，从文本中抽取你认为有意义、值得翻译的词或短语。
+不要机械套用任何"通用词剔除列表"。如果某个词在上下文中具有不可替代的专业含义，即使它表面看起来是通用词汇，也应保留。
+优先关注：专业领域概念、文化负载词、制度性概念、具有歧义性或翻译难点的词、缩写与全称对照。
+★ 术语首次出现时附有括号外文标注 → 翻译价值极高，必须建立完整的双向对译关系。
 
 ═══════════════════════════════════════════
-【第四步：原文-译文方向判定（仅类型C）】
+【第四步：原文-译文方向判定（类型C 及 类型B括号标注子类型）】
 ═══════════════════════════════════════════
 根据"概念首倡语言"判定source_lang，而非表面书写语言。
+★ 对于括号标注文本（如"相互性（mutuality）"），每个括号对对应输出两个条目（zh→外文 + 外文→zh），translation_source 设为 "file"，translation_confidence 设为 0.95-1.0。
 
 ═══════════════════════════════════════════
 【输出格式】
@@ -1089,7 +1248,7 @@ function buildSystemInstruction(
 {
   "source_term": "源术语文本",
   "source_lang": "zh|en|fr|ja|es|de|ru|ar|ko|it|pt",
-  "target_term": "目标术语 或 null（类型A/B时全部为null，类型C/D仅在存在对译时填写）",
+"target_term": "目标术语 或 null（类型A时全部为null；类型B括号标注子类型时括号内文本即为target_term，不可为null；类型C/D/E仅在存在对译时填写）",
   "target_lang": "zh|en|fr|ja|es|de|ru|ar|ko|it|pt 或 null",
   "translation_source": "file|none",
   "translation_confidence": 0.0-1.0,
@@ -1415,53 +1574,10 @@ function calculateTranslationValueV2(
     valueScore += 0.5;
   }
   
-  // 低价值中文词扣分
-  const lowValueChineseWords = [
-    '数据', '使用', '应用', '系统', '方法', '方式', '管理', '发展', '研究', '建设', 
-    '水平', '工作', '问题', '情况', '过程', '条件', '因素', '结果', '影响', '关系', 
-    '结构', '时间', '空间', '资源', '信息', '知识', '技术', '服务', '产品', '用户',
-    '程度', '范围', '领域', '方面', '内容', '形式', '手段', '工具', '途径', '措施',
-    '政策', '制度', '体制', '机制', '模式', '框架', '体系', '格局', '态势', '趋势',
-  ];
-  for (const word of lowValueChineseWords) {
-    if (termText === word) {
-      valueScore -= 2.5;  // 完全匹配严重扣分
-      break;
-    }
-    if (termText.includes(word) && termText.length <= word.length + 2) {
-      valueScore -= 1.0;  // 主要包含该词的复合词中等扣分
-      break;
-    }
-  }
+  // [移除] 所有扣分规则已移除 - AI自主判断术语价值，不再做规则性扣分
   
-  // 低价值英文词扣分
-  const lowValueEnglishWords = [
-    'data', 'system', 'method', 'process', 'result', 'analysis', 'application', 
-    'development', 'management', 'research', 'technology', 'service', 'product', 
-    'project', 'information', 'solution', 'approach', 'requirement', 'standard', 
-    'policy', 'strategy', 'framework', 'component', 'feature', 'function', 'module',
-    'operation', 'performance', 'quality', 'efficiency', 'effectiveness', 'impact',
-    'challenge', 'opportunity', 'trend', 'innovation', 'transformation', 'evolution',
-    'revolution', 'disruption', 'optimization', 'implementation', 'integration',
-  ];
-  for (const word of lowValueEnglishWords) {
-    if (termText.toLowerCase() === word) {
-      valueScore -= 2.5;
-      break;
-    }
-  }
-  
-  // 常见套话模式扣分
-  if (/^(具有重要意义|进一步加强|持续推进|不断深化|全面落实|积极推动|大力开展|深入贯彻|坚持|确保)$/.test(termText)) {
-    valueScore -= 3.0;
-  }
-  
-  // 过短且非缩写扣分
-  if (termText.length < 3 && !/^[A-Z]{2,}$/.test(termText)) {
-    valueScore -= 1.5;
-  }
-  
-  // [已移除] 非含中文语对扣分 - 不再强制过滤非中文语对，由用户自行筛选
+  // 基础价值保底：即使是简单词也获得至少 2.5 分的基础价值
+  valueScore = Math.max(2.5, valueScore);
   
   // 综合计算最终得分：两个维度各占50%，映射到0-10
   let finalScore = (semanticScore * 0.5 + valueScore * 0.5) * 2;

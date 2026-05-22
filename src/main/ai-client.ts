@@ -2,23 +2,77 @@ import { ExtractedTerm } from './term-engine';
 import { APIResponseHandler } from './api-response-handler';
 
 const DEFAULT_OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+/**
+ * 脱敏 API Key，仅保留首末 N 位可见
+ * 例如: maskApiKey("sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") → "sk-xxxx****xxxx"
+ * @param key 原始 API Key
+ * @param visibleChars 首末保留的可见字符数，默认 4
+ */
+export function maskApiKey(key: string | undefined | null, visibleChars: number = 4): string {
+  if (!key) return "(未设置)";
+  if (key.length <= visibleChars * 2) return "*".repeat(key.length);
+  return key.slice(0, visibleChars) + "****" + key.slice(-visibleChars);
+}
+
+
+export type AIProviderKey = 'openai' | 'deepseek' | 'anthropic' | 'custom';
+
+export interface AIProviderInfo {
+  name: string;
+  endpoint: string;
+  defaultModel: string;
+  models: string[];
+}
 
 // 支持的AI提供商配置
-const AI_PROVIDERS = {
-  openai: {
-    name: 'OpenAI',
-    endpoint: 'https://api.openai.com/v1/chat/completions',
-    defaultModel: 'gpt-4o-mini'
-  },
+export const AI_PROVIDERS: Record<string, AIProviderInfo> = {
   deepseek: {
     name: 'DeepSeek',
     endpoint: 'https://api.deepseek.com/v1/chat/completions',
-    defaultModel: 'deepseek-chat'
+    defaultModel: 'deepseek-chat',
+    models: ['deepseek-chat', 'deepseek-reasoner']
+  },
+  openai: {
+    name: 'OpenAI',
+    endpoint: 'https://api.openai.com/v1/chat/completions',
+    defaultModel: 'gpt-4o-mini',
+    models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o3-mini', 'o1', 'o1-mini']
   },
   anthropic: {
-    name: 'Anthropic',
+    name: 'Anthropic (Claude)',
     endpoint: 'https://api.anthropic.com/v1/messages',
-    defaultModel: 'claude-3-haiku-20240307'
+    defaultModel: 'claude-3-5-haiku-latest',
+    models: ['claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest', 'claude-3-opus-latest', 'claude-3-haiku-20240307']
+  },
+  qianwen: {
+    name: '通义千问 (阿里)',
+    endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+    defaultModel: 'qwen-plus',
+    models: ['qwen-plus', 'qwen-max', 'qwen-turbo', 'qwen-plus-latest', 'qwen-max-latest']
+  },
+  zhipu: {
+    name: '智谱 GLM',
+    endpoint: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    defaultModel: 'glm-4-flash',
+    models: ['glm-4-plus', 'glm-4-flash', 'glm-4-air', 'glm-4-long']
+  },
+  moonshot: {
+    name: '月之暗面 (Kimi)',
+    endpoint: 'https://api.moonshot.cn/v1/chat/completions',
+    defaultModel: 'moonshot-v1-8k',
+    models: ['moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k']
+  },
+  baidu: {
+    name: '百度文心一言',
+    endpoint: 'https://qianfan.baidubce.com/v2/chat/completions',
+    defaultModel: 'ernie-4.0-turbo-8k',
+    models: ['ernie-4.0-turbo-8k', 'ernie-3.5-8k', 'ernie-speed-8k', 'ernie-lite-8k']
+  },
+  bytedance: {
+    name: '字节豆包',
+    endpoint: 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
+    defaultModel: 'doubao-pro-32k',
+    models: ['doubao-pro-32k', 'doubao-pro-128k', 'doubao-lite-32k', 'doubao-lite-128k']
   }
 } as const;
 
@@ -29,6 +83,7 @@ const SETTINGS_KEY_MAP = {
   'endpoint': 'endpoint',
   'promptTemplate': 'promptTemplate',
   'model': 'model',
+  'provider': 'provider',
   'dataPath': 'dataPath',
   'data_path': 'dataPath',
 
@@ -36,7 +91,8 @@ const SETTINGS_KEY_MAP = {
   'ai_api_key': 'apiKey',
   'ai_endpoint': 'endpoint',
   'ai_model': 'model',
-  'ai_prompt_template': 'promptTemplate'
+  'ai_prompt_template': 'promptTemplate',
+  'ai_provider': 'provider'
 } as const;
 
 export interface AIConfig {
@@ -44,6 +100,7 @@ export interface AIConfig {
   endpoint?: string;
   promptTemplate?: string;
   model?: string;
+  provider?: string;  // 选择的 AI 平台标识，如 'deepseek', 'openai' 等
   dataPath?: string;
 }
 
