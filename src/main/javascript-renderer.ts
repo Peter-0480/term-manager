@@ -4,6 +4,7 @@
 
 import { app, BrowserView, BrowserWindow } from 'electron';
 import { advancedFetch, FetchOptions, FetchResult } from './advanced-fetcher';
+import { ExtractionErrorCode, classifyExtractionError, getErrorSummary } from '../types/errors';
 
 interface RenderOptions {
   url: string;
@@ -639,10 +640,15 @@ export async function smartWebFetch(options: FetchOptions & {
         };
       } catch (jsError) {
         console.error(`[Smart Web Fetch] JavaScript rendering fallback also failed:`, jsError);
+        const classified = classifyExtractionError(jsError as Error, ExtractionErrorCode.VERIFICATION_AFTER_JS_RENDER);
         return {
           success: false,
           html: '',
-          error: `网页抓取失败：该网站触发了反爬虫保护，且JavaScript渲染也未能获取内容。请尝试：1) 手动复制网页内容进行文本抽取；2) 更换其他网页URL。`,
+          error: `网页抓取失败：${classified.message}`,
+          errorCode: classified.code,
+          errorSummary: `网页抓取失败：${classified.message}`,
+          errorSuggestion: classified.suggestion,
+          isRetryable: classified.isRetryable,
         };
       }
     }

@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import fs from 'fs';
 import path from 'path';
+import { ExtractionErrorCode, classifyExtractionError, type ExtractionError } from '../types/errors';
 
 export interface FetchOptions {
   url: string;
@@ -15,6 +16,10 @@ export interface FetchResult {
   success: boolean;
   html: string;
   error?: string;
+  errorCode?: ExtractionErrorCode;
+  errorSummary?: string;
+  errorSuggestion?: string;
+  isRetryable?: boolean;
   statusCode?: number;
   redirected?: boolean;
   finalUrl?: string;
@@ -405,14 +410,43 @@ export async function advancedFetch(options: FetchOptions): Promise<FetchResult>
     }
   }
   
-  // 所有尝试都失败
-  const errorMessage = lastError?.message || '未知错误';
+  // 所有尝试都失败 - 使用错误分类系统生成详细提示
+  const rawMessage = lastError?.message || '未知错误';
   console.error(`[Advanced Fetcher] All ${retryCount} attempts failed for URL: ${url}`);
+  
+  // 根据HTTP状态码从rawMessage中提取状态码信息
+  const statusMatch = rawMessage.match(/HTTP (\d{3})/);
+  const statusCode = statusMatch ? parseInt(statusMatch[1]) : undefined;
+  
+  let errorCode: ExtractionErrorCode;
+  if (statusCode === 403) {
+    errorCode = ExtractionErrorCode.HTTP_403_FORBIDDEN;
+  } else if (statusCode === 404) {
+    errorCode = ExtractionErrorCode.HTTP_404_NOT_FOUND;
+  } else if (statusCode === 429) {
+    errorCode = ExtractionErrorCode.HTTP_429_RATE_LIMITED;
+  } else if (statusCode && statusCode >= 500) {
+    errorCode = ExtractionErrorCode.HTTP_5XX_SERVER_ERROR;
+  } else if (rawMessage.includes('VERIFICATION_PAGE_NEED_JS_RENDER') || rawMessage.includes('验证') || rawMessage.includes('反爬虫')) {
+    errorCode = ExtractionErrorCode.VERIFICATION_PAGE;
+  } else if (rawMessage.includes('内容提取过少') || rawMessage.includes('too short')) {
+    errorCode = ExtractionErrorCode.CONTENT_TOO_SHORT;
+  } else {
+    // 对于其他错误，使用分类器分析错误消息
+    const classified = classifyExtractionError(lastError || rawMessage);
+    errorCode = classified.code;
+  }
+  
+  const classifiedError = classifyExtractionError(lastError || rawMessage, errorCode);
   
   return {
     success: false,
     html: '',
-    error: `网页抽取失败: ${errorMessage}`,
+    error: `网页抽取失败: ${classifiedError.message}`,
+    errorCode: classifiedError.code,
+    errorSummary: `网页抽取失败: ${classifiedError.message}`,
+    errorSuggestion: classifiedError.suggestion,
+    isRetryable: classifiedError.isRetryable,
   };
 }
 

@@ -8,8 +8,10 @@ import {
   SmartExtractionResult 
 } from './smart-extractor';
 import { smartWebFetch } from '../javascript-renderer';
+import { FetchResult } from '../advanced-fetcher';
 import { ProgressReporter, ProgressStages, defaultProgressEstimator } from '../progress-reporter';
 import { extractHtmlContent, simpleHtmlToText, extractBilingualTableRows, formatBilingualPairsForExtraction, sanitizeHtmlForAI } from '../html-content-extractor';
+import { ExtractionErrorCode, getErrorSummary, classifyExtractionError, ExtractionErrorClass } from '../../types/errors';
 import { getCanvasDiagnostics } from '../pdf-polyfills';
 import { 
   extractTermsFromPDFViaAI, 
@@ -1782,6 +1784,54 @@ export async function extractTermsFromPDFWithAI(
   return extractTermsFromPDFViaAI(filePath, language, aiConfig, onProgress, maxPages);
 }
 
+/**
+ * Format a FetchResult error into a user-friendly message string.
+ * Uses the errorSummary and errorSuggestion fields already populated by advanced-fetcher.
+ */
+function formatFetchError(result: FetchResult): string {
+  const parts: string[] = [];
+  
+  if (result.errorSummary) {
+    parts.push(result.errorSummary);
+  } else if (result.error) {
+    parts.push(result.error);
+  } else {
+    parts.push('网页抽取失败，未知错误');
+  }
+
+  if (result.errorSuggestion) {
+    parts.push(`💡 ${result.errorSuggestion}`);
+  }
+
+  // Include status code info if available
+  if (result.statusCode && result.statusCode >= 400) {
+    parts.push(`(HTTP ${result.statusCode})`);
+  }
+
+  return parts.join('\n');
+}
+
+/**
+ * Build a structured ExtractionErrorClass from a failed FetchResult.
+ * This preserves errorCode, suggestion, isRetryable for propagation to the UI.
+ */
+function buildFetchError(result: FetchResult, prefix?: string): ExtractionErrorClass {
+  const errorSummary = result.errorSummary || result.error || '网页抽取失败，未知错误';
+  const message = prefix ? `${prefix}：${errorSummary}` : errorSummary;
+  const code = result.errorCode || ExtractionErrorCode.UNKNOWN_ERROR;
+  const suggestion = result.errorSuggestion || getErrorSuggestionForCode(code);
+  const isRetryable = result.isRetryable ?? (code !== ExtractionErrorCode.HTTP_403_FORBIDDEN && code !== ExtractionErrorCode.HTTP_404_NOT_FOUND && code !== ExtractionErrorCode.VERIFICATION_PAGE && code !== ExtractionErrorCode.VERIFICATION_AFTER_JS_RENDER && code !== ExtractionErrorCode.ANTI_BOT_PROTECTION);
+  return new ExtractionErrorClass(code, message, suggestion, isRetryable);
+}
+
+/**
+ * Get a default suggestion for a given error code (fallback when FetchResult lacks suggestion)
+ */
+function getErrorSuggestionForCode(code: ExtractionErrorCode): string {
+  const details = classifyExtractionError(new Error(''), code);
+  return details.suggestion;
+}
+
 export async function extractTermsFromUrl(
   url: string,
   language: 'en' | 'zh' | 'auto' = 'auto',
@@ -1809,11 +1859,20 @@ export async function extractTermsFromUrl(
     });
     
     if (!result.success) {
-      throw new Error(result.error || '网页抓取失败');
+      throw buildFetchError(result, '网页抽取失败');
     }
     
     const html = result.html;
     console.log(`[Term Engine] Successfully extracted ${html.length} chars from URL: ${url}`);
+
+    // Check if the extracted HTML actually contains meaningful content
+    if (!html || html.trim().length < 50) {
+      throw buildFetchError({
+        ...result,
+        errorCode: result.errorCode || ExtractionErrorCode.CONTENT_TOO_SHORT,
+        errorSummary: result.errorSummary || '提取到的网页文本内容过少，页面可能为空或动态加载失败',
+      }, '网页抽取失败');
+    }
     
     // 更新进度：网页抓取完成，开始HTML解析
     if (progressReporter) {
@@ -1839,6 +1898,15 @@ export async function extractTermsFromUrl(
       // [优化] AI路径：使用精简HTML保留结构信息，让AI更准确识别正文/标题/列表
       text = sanitizeHtmlForAI(html);
       console.log(`[Term Engine] AI path: using sanitized HTML (${text.length} chars with structure preserved)`);
+      
+      // Check if sanitized HTML is too short for AI processing
+      if (!text || text.trim().length < 30) {
+        throw buildFetchError({
+          ...result,
+          errorCode: ExtractionErrorCode.CONTENT_TOO_SHORT,
+          errorSummary: '提取到的网页文本内容过少（不足30字符），无法进行AI术语分析。可能原因：1) 网页主要为图片/视频内容；2) 页面内容需要登录后才能查看；3) 网站拦截了内容提取',
+        }, '网页抽取失败');
+      }
     } else {
       // 规则路径：使用增强的HTML内容提取，过滤噪声
       const extracted = extractHtmlContent(html);
@@ -1862,10 +1930,23 @@ export async function extractTermsFromUrl(
     // 调用文本提取函数
     return extractTermsFromText(text, language, useAI, aiConfig);
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('请求超时，网站响应过慢或无法访问。');
+    if (error instanceof ExtractionErrorClass) {
+      throw error;
     }
-    throw new Error('网页抽取失败: ' + (error instanceof Error ? error.message : String(error)));
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new ExtractionErrorClass(
+        ExtractionErrorCode.TIMEOUT,
+        '请求超时，网站响应过慢或无法访问',
+        '建议：1) 检查网络连接是否正常；2) 尝试关闭AI增强模式；3) 使用「手动文本」方式抽取',
+        true
+      );
+    }
+    throw new ExtractionErrorClass(
+      ExtractionErrorCode.UNKNOWN_ERROR,
+      '网页抽取失败: ' + (error instanceof Error ? error.message : String(error)),
+      '程序遇到了未预期的异常。建议：1) 检查控制台日志了解详情；2) 重启程序后重试',
+      true
+    );
   }
 }
 
@@ -1898,11 +1979,20 @@ export async function extractTermsFromUrlWithMeta(
     });
     
     if (!result.success) {
-      throw new Error(result.error || '网页抓取失败');
+      throw buildFetchError(result, '网页抽取失败');
     }
     
     const html = result.html;
     console.log(`[Term Engine] Successfully extracted ${html.length} chars from URL: ${url}`);
+
+    // Check if the extracted HTML actually contains meaningful content
+    if (!html || html.trim().length < 50) {
+      throw buildFetchError({
+        ...result,
+        errorCode: result.errorCode || ExtractionErrorCode.CONTENT_TOO_SHORT,
+        errorSummary: result.errorSummary || '提取到的网页文本内容过少，页面可能为空或动态加载失败',
+      }, '网页抽取失败');
+    }
     
     if (progressReporter) {
       progressReporter.updateStage(
@@ -1917,6 +2007,14 @@ export async function extractTermsFromUrlWithMeta(
     if (useAI && aiConfig) {
       text = sanitizeHtmlForAI(html);
       console.log(`[Term Engine] AI path (withMeta): using sanitized HTML (${text.length} chars with structure preserved)`);
+      
+      if (!text || text.trim().length < 30) {
+        throw buildFetchError({
+          ...result,
+          errorCode: ExtractionErrorCode.CONTENT_TOO_SHORT,
+          errorSummary: '提取到的网页文本内容过少（不足30字符），无法进行AI术语分析。可能原因：1) 网页主要为图片/视频内容；2) 页面内容需要登录后才能查看；3) 网站拦截了内容提取',
+        }, '网页抽取失败');
+      }
     } else {
       const extracted = extractHtmlContent(html);
       text = extracted.text;
@@ -1964,10 +2062,23 @@ export async function extractTermsFromUrlWithMeta(
     // 调用带元数据的文本提取
     return extractTermsFromTextWithMeta(text, language, useAI, aiConfig);
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('请求超时，网站响应过慢或无法访问。');
+    if (error instanceof ExtractionErrorClass) {
+      throw error;
     }
-    throw new Error('网页抽取失败: ' + (error instanceof Error ? error.message : String(error)));
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new ExtractionErrorClass(
+        ExtractionErrorCode.TIMEOUT,
+        '请求超时，网站响应过慢或无法访问',
+        '建议：1) 检查网络连接是否正常；2) 尝试关闭AI增强模式；3) 使用「手动文本」方式抽取',
+        true
+      );
+    }
+    throw new ExtractionErrorClass(
+      ExtractionErrorCode.UNKNOWN_ERROR,
+      '网页抽取失败: ' + (error instanceof Error ? error.message : String(error)),
+      '程序遇到了未预期的异常。建议：1) 检查控制台日志了解详情；2) 重启程序后重试',
+      true
+    );
   }
 }
 
@@ -2150,11 +2261,20 @@ export async function smartExtractTermsFromUrl(
     });
     
     if (!result.success) {
-      throw new Error(result.error || '网页抓取失败');
+      throw buildFetchError(result, 'URL抽取失败');
     }
     
     const html = result.html;
     console.log(`[Term Engine] smartExtractTermsFromUrl: ${html.length} chars from ${url}`);
+
+    // Check if the extracted HTML actually contains meaningful content
+    if (!html || html.trim().length < 50) {
+      throw buildFetchError({
+        ...result,
+        errorCode: result.errorCode || ExtractionErrorCode.CONTENT_TOO_SHORT,
+        errorSummary: result.errorSummary || '提取到的网页文本内容过少，页面可能为空或动态加载失败',
+      }, 'URL抽取失败');
+    }
     
     let text: string;
     
@@ -2162,6 +2282,14 @@ export async function smartExtractTermsFromUrl(
     if (strategy.mode === 'ai-only' && strategy.aiConfig) {
       text = sanitizeHtmlForAI(html);
       console.log(`[Term Engine] smart AI path: using sanitized HTML (${text.length} chars with structure preserved)`);
+      
+      if (!text || text.trim().length < 30) {
+        throw buildFetchError({
+          ...result,
+          errorCode: ExtractionErrorCode.CONTENT_TOO_SHORT,
+          errorSummary: '提取到的网页文本内容过少（不足30字符），无法进行AI术语分析。可能原因：1) 网页主要为图片/视频内容；2) 页面内容需要登录后才能查看；3) 网站拦截了内容提取',
+        }, 'URL抽取失败');
+      }
     } else {
       // 规则路径：使用增强的HTML内容提取
       const extracted = extractHtmlContent(html);
@@ -2176,6 +2304,14 @@ export async function smartExtractTermsFromUrl(
     
     return smartExtractTerms(text, language, strategy);
   } catch (error) {
-    throw new Error('URL抽取失败: ' + (error instanceof Error ? error.message : String(error)));
+    if (error instanceof ExtractionErrorClass) {
+      throw error;
+    }
+    throw new ExtractionErrorClass(
+      ExtractionErrorCode.UNKNOWN_ERROR,
+      'URL抽取失败: ' + (error instanceof Error ? error.message : String(error)),
+      '程序遇到了未预期的异常。建议：1) 检查控制台日志了解详情；2) 重启程序后重试',
+      true
+    );
   }
 }

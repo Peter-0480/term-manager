@@ -53,6 +53,37 @@ import { DEFAULT_STRATEGY, ExtractionStrategy } from './term-engine/smart-extrac
 import { getAIConfigFromSettings, validateAIConfig, testAIConnection, AI_PROVIDERS } from './ai-client';
 import { detectLanguage, translateWithAI, alignTerms, batchTranslateTerms } from './ai-language-detection';
 import { createWebExtractionProgressReporter, ProgressStages, ProgressMessages, defaultProgressEstimator } from './progress-reporter';
+import { ExtractionErrorClass } from '../types/errors';
+
+/**
+ * 将捕获的错误转换为结构化的前端友好响应
+ * 对于ExtractionErrorClass，返回详细的分类错误信息
+ * 对于普通Error，返回统一的错误信息
+ */
+function toStructuredError(error: unknown, context: string): {
+  success: false;
+  error: string;
+  errorCode?: string;
+  errorSummary?: string;
+  errorSuggestion?: string;
+  isRetryable?: boolean;
+} {
+  if (error instanceof ExtractionErrorClass) {
+    console.error(`[${context}] ${error.code}: ${error.message}`);
+    return {
+      success: false,
+      error: error.message,
+      errorCode: error.code,
+      errorSummary: error.message,
+      errorSuggestion: error.suggestion,
+      isRetryable: error.isRetryable ?? false,
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[${context}] Error:`, error);
+  return { success: false, error: message };
+}
+
 export function registerIPCHandlers() {
   // Terms handlers
   ipcMain.handle('get-terms', (_, params) => {
@@ -256,7 +287,7 @@ export function registerIPCHandlers() {
       return { success: true, data, metadata };
     } catch (error) {
       console.error('[Extraction] Error:', error);
-      return { success: false, error: (error as Error).message };
+      return toStructuredError(error, 'Text Extraction');
     }
   });
 
@@ -292,7 +323,7 @@ export function registerIPCHandlers() {
       );
       return { success: true, data };
     } catch (error) {
-      return { success: false, error: (error as Error).message };
+      return toStructuredError(error, 'File Extraction');
     }
   });
 
@@ -379,9 +410,9 @@ export function registerIPCHandlers() {
       
       return { success: true, data, metadata };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      progressReporter.error(errorMessage);
-      return { success: false, error: errorMessage };
+      const structured = toStructuredError(error, 'URL Extraction');
+      progressReporter.error(structured.error);
+      return structured;
     }
   });
 
@@ -553,7 +584,7 @@ export function registerIPCHandlers() {
       return { success: true, data };
     } catch (error) {
       console.error('[Smart Extraction] Error:', error);
-      return { success: false, error: (error as Error).message };
+      return toStructuredError(error, 'Smart Text Extraction');
     }
   });
 
@@ -591,7 +622,7 @@ export function registerIPCHandlers() {
       return { success: true, data: results };
     } catch (error) {
       console.error('[AI PDF Extraction] Error:', error);
-      return { success: false, error: (error as Error).message };
+      return toStructuredError(error, 'AI PDF Extraction');
     }
   });
 
@@ -611,7 +642,7 @@ export function registerIPCHandlers() {
       return { success: true, data };
     } catch (error) {
       console.error('[Smart Extraction] File error:', error);
-      return { success: false, error: (error as Error).message };
+      return toStructuredError(error, 'Smart File Extraction');
     }
   });
 
@@ -631,7 +662,7 @@ export function registerIPCHandlers() {
       return { success: true, data };
     } catch (error) {
       console.error('[Smart Extraction] URL error:', error);
-      return { success: false, error: (error as Error).message };
+      return toStructuredError(error, 'Smart URL Extraction');
     }
   });
 

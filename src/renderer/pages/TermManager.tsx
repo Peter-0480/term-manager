@@ -510,6 +510,8 @@ export default function TermManager() {
   // 导出对话框状态
   const [isExportDialogVisible, setIsExportDialogVisible] = useState(false);
   const [exportFormat, setExportFormat] = useState<'csv' | 'json'>('csv');
+  const [exportScope, setExportScope] = useState<'current' | 'all'>('current');
+
   const [exportIncludeFields, setExportIncludeFields] = useState<string[]>([
     'id', 'source_lang', 'term_text', 'abbreviation', 'target_lang', 'target_text', 'domain', 'description', 'created_at', 'updated_at'
   ]);
@@ -941,12 +943,73 @@ export default function TermManager() {
     try {
       const result = await ipcApi.showSaveDialog({
         title: '导出术语',
-        defaultPath: `terms-${new Date().toISOString().slice(0, 10)}.csv`,
-        filters: [{ name: 'CSV', extensions: ['csv'] }]
+        defaultPath: `terms-${new Date().toISOString().slice(0, 10)}.${exportFormat === 'json' ? 'json' : 'csv'}`,
+        filters: exportFormat === 'json'
+          ? [{ name: 'JSON', extensions: ['json'] }]
+          : [{ name: 'CSV', extensions: ['csv'] }]
       });
       if (result.canceled || !result.filePath) return;
 
-      const header = ['id', 'source_lang', 'term_text', 'abbreviation', 'target_lang', 'target_text', 'domain', 'description', 'created_at', 'updated_at'];
+      let exportData: Term[] = [];
+      if (exportScope === 'all') {
+        message.loading({ content: '正在获取全部术语数据...', key: 'export-loading', duration: 0 });
+        const allParams: any = { page: 1, pageSize: 1000000, keyword: keyword || undefined };
+        const domainParam = selectedDomain === 0 ? undefined : selectedDomain;
+        if (domainParam !== undefined) allParams.domain = domainParam;
+        if (sortField) { allParams.sortField = sortField; allParams.sortOrder = sortOrder; }
+        if (selectedSourceLang && selectedSourceLang !== 'all') allParams.sourceLang = selectedSourceLang;
+        if (selectedTargetLangs && selectedTargetLangs.length > 0 && !selectedTargetLangs.includes('all')) allParams.targetLangs = selectedTargetLangs;
+        if (advancedSearchParams.keyword) allParams.keyword = advancedSearchParams.keyword;
+        if (advancedSearchParams.domains && advancedSearchParams.domains.length > 0) allParams.domains = advancedSearchParams.domains;
+        if (advancedSearchParams.sourceLangs && advancedSearchParams.sourceLangs.length > 0) allParams.sourceLangs = advancedSearchParams.sourceLangs;
+        if (advancedSearchParams.targetLangs && advancedSearchParams.targetLangs.length > 0) allParams.targetLangs = advancedSearchParams.targetLangs;
+        if (advancedSearchParams.locked !== undefined) allParams.locked = advancedSearchParams.locked;
+        if (advancedSearchParams.hasTranslation !== undefined) allParams.hasTranslation = advancedSearchParams.hasTranslation;
+        if (advancedSearchParams.favorite !== undefined) allParams.favorite = advancedSearchParams.favorite;
+        if (columnFilters.sourceLang && columnFilters.sourceLang.length > 0) allParams.sourceLangs = columnFilters.sourceLang;
+        if (columnFilters.targetLang && columnFilters.targetLang.length > 0) allParams.translationLanguages = columnFilters.targetLang;
+        if (columnFilters.translationStatus && columnFilters.translationStatus !== 'all') allParams.translationStatus = columnFilters.translationStatus;
+        if (columnFilters.domains && columnFilters.domains.length > 0) allParams.domains = columnFilters.domains;
+        if (columnFilters.hasAbbreviation !== undefined && columnFilters.hasAbbreviation !== null) allParams.hasAbbreviation = columnFilters.hasAbbreviation;
+        if (columnFilters.favorite !== undefined) allParams.favorite = columnFilters.favorite;
+        const res = await ipcApi.getTerms(allParams);
+        message.destroy('export-loading');
+        if (res.success) { exportData = res.data || []; }
+        else { message.error(res.error || '获取全部术语失败'); return; }
+      } else {
+        exportData = terms;
+      }
+      if (exportData.length === 0) { message.warning('没有可导出的术语数据'); return; }
+      const fieldLabels: Record<string, string> = { 'id': 'ID', 'source_lang': '源语言', 'term_text': '术语原文', 'abbreviation': '简称', 'target_lang': '目标语言', 'target_text': '术语译文', 'domain': '领域', 'description': '注释', 'created_at': '创建时间', 'updated_at': '更新时间' };
+      const allFieldKeys = ['id', 'source_lang', 'term_text', 'abbreviation', 'target_lang', 'target_text', 'domain', 'description', 'created_at', 'updated_at'];
+      const includedFields = allFieldKeys.filter((f) => exportIncludeFields.includes(f));
+      let content: string;
+      if (exportFormat === 'json') {
+        const jsonData = exportData.map((t) => {
+          const domain = domains.find((d) => d.id === t.domain_id)?.name || '';
+          const record: Record<string, any> = {};
+          for (const field of includedFields) { record[field] = field === 'domain' ? domain : (t as any)[field] || ''; }
+          return record;
+        });
+        content = JSON.stringify(jsonData, null, 2);
+      } else {
+        const header = includedFields.map((f) => fieldLabels[f] || f);
+        const rows = exportData.map((t) => {
+          const domain = domains.find((d) => d.id === t.domain_id)?.name || '';
+          return includedFields.map((field) => { const value = field === 'domain' ? domain : (t as any)[field] || ''; return '"' + String(value).replace(/"/g, '""') + '"'; }).join(',');
+        });
+        content = '\uFEFF' + [header.join(','), ...rows].join('\n');
+      }
+      const saveRes = await ipcApi.saveFile(result.filePath, content);
+      if (saveRes.success) { message.success('导出成功（共 ' + exportData.length + ' 条术语）'); }
+      else { message.error(saveRes.error || '导出失败'); }
+    } catch {
+      message.destroy('export-loading');
+      message.error('导出失败');
+    }
+  };
+
+  /**
       const rows = terms.map((t) => {
         const domain = domains.find((d) => d.id === t.domain_id)?.name || '';
         return [
@@ -973,6 +1036,47 @@ export default function TermManager() {
       }
     } catch {
       message.error('导出失败');
+    }
+  };
+  /* CLOSE-ORPHAN */
+
+  /**
+   * 显示详细的抽取失败提示，包含具体原因分类和AI增强模式下的建设性建议
+   * 后端通过 toStructuredError() 返回 errorCode / errorSummary / errorSuggestion / isRetryable
+   */
+
+  /**
+   * 显示详细的抽取失败提示，包含具体原因分类和AI增强模式下的建设性建议
+   * 后端通过 toStructuredError() 返回 errorCode / errorSummary / errorSuggestion / isRetryable
+   */
+  const showExtractionError = (res: any, fallbackMessage: string) => {
+    const errorMsg = res.error || res.errorSummary || fallbackMessage;
+    const suggestion = res.errorSuggestion;
+    const isRetryable = res.isRetryable;
+
+    if (suggestion) {
+      // 显示详细错误（含建议），持续时间更长以便用户完整阅读
+      message.error(
+        {
+          content: (
+            <div>
+              <div style={{ fontWeight: 500, marginBottom: 4 }}>{errorMsg}</div>
+              <div style={{ color: '#1677ff', fontSize: 13 }}>
+                💡 {suggestion}
+              </div>
+              {isRetryable && (
+                <div style={{ marginTop: 6, color: '#999', fontSize: 12 }}>
+                  此问题可重试，建议修复网络/配置后再次尝试
+                </div>
+              )}
+            </div>
+          ),
+          duration: 10,
+        },
+        10
+      );
+    } else {
+      message.error(errorMsg, 8);
     }
   };
 
@@ -1034,13 +1138,13 @@ export default function TermManager() {
         } else {
           setFileExtractLoading(false);
           setFileExtractProgress('');
-          message.error(res.error || '文件抽取失败');
+          showExtractionError(res, '文件抽取失败');
         }
       } catch (error) {
         setFileExtractLoading(false);
         setFileExtractProgress('');
         console.error('File extraction error:', error);
-        message.error('文件抽取失败');
+        showExtractionError({ error: error instanceof Error ? error.message : '文件抽取失败' }, '文件抽取失败');
       }
     } catch (error) {
       setFileExtractLoading(false);
@@ -1240,12 +1344,12 @@ export default function TermManager() {
       } else {
         setFileExtractLoading(false);
         setFileExtractProgress('');
-        message.error(res.error || '抽取失败');
+        showExtractionError(res, '文本抽取失败');
       }
     } catch (error) {
       setFileExtractLoading(false);
       setFileExtractProgress('');
-      message.error(error instanceof Error ? error.message : '抽取失败');
+      showExtractionError({ error: error instanceof Error ? error.message : '文本抽取失败' }, '文本抽取失败');
     }
   };
   const extractFromUrl = async () => {
@@ -1314,12 +1418,12 @@ export default function TermManager() {
       } else {
         setFileExtractLoading(false);
         setFileExtractProgress('');
-        message.error(res.error || '抽取失败');
+        showExtractionError(res, 'URL网页抽取失败');
       }
     } catch (error) {
       setFileExtractLoading(false);
       setFileExtractProgress('');
-      message.error(error instanceof Error ? error.message : '抽取失败');
+      showExtractionError({ error: error instanceof Error ? error.message : 'URL网页抽取失败' }, 'URL网页抽取失败');
     }
   };
 
@@ -1589,13 +1693,13 @@ export default function TermManager() {
       } else {
         setSmartExtractLoading(false);
         setSmartExtractProgress('');
-        message.error(res.error || '智能抽取失败');
+        showExtractionError(res, '智能文本抽取失败');
       }
     } catch (error) {
       setSmartExtractLoading(false);
       setSmartExtractProgress('');
       console.error('Smart extraction error:', error);
-      message.error(error instanceof Error ? error.message : '智能抽取失败');
+      showExtractionError({ error: error instanceof Error ? error.message : '智能文本抽取失败' }, '智能文本抽取失败');
     }
   };
 
@@ -1688,13 +1792,13 @@ export default function TermManager() {
         } else {
           setSmartExtractLoading(false);
           setSmartExtractProgress('');
-          message.error(res.error || '智能抽取失败');
+          showExtractionError(res, '智能文件抽取失败');
         }
       } catch (error) {
         setSmartExtractLoading(false);
         setSmartExtractProgress('');
         console.error('Smart extraction error:', error);
-        message.error('智能抽取失败');
+        showExtractionError({ error: error instanceof Error ? error.message : '智能文件抽取失败' }, '智能文件抽取失败');
       }
     } catch (error) {
       setSmartExtractLoading(false);
@@ -1725,11 +1829,11 @@ export default function TermManager() {
         setSelectedSmartExtracted(new Set());
         message.success(`智能抽取完成，找到 ${data.length} 个专业术语`);
       } else {
-        message.error(res.error || '智能抽取失败');
+        showExtractionError(res, '智能网页抽取失败');
       }
     } catch (error) {
       console.error('Smart extraction error:', error);
-      message.error('智能抽取失败');
+      showExtractionError({ error: error instanceof Error ? error.message : '智能网页抽取失败' }, '智能网页抽取失败');
     }
   };
 
@@ -4848,6 +4952,20 @@ export default function TermManager() {
           <Divider />
           
           <div>
+            <strong>选择导出范围</strong>
+            <Radio.Group
+              value={exportScope}
+              onChange={(e) => setExportScope(e.target.value)}
+              style={{ marginTop: 8 }}
+            >
+              <Radio value="current">当前页面显示的内容</Radio>
+              <Radio value="all">全部结果（含当前筛选条件）</Radio>
+            </Radio.Group>
+          </div>
+          
+          <Divider />
+          
+          <div>
             <strong>选择包含字段</strong>
             <Checkbox.Group
               value={exportIncludeFields}
@@ -4873,7 +4991,7 @@ export default function TermManager() {
             <p><strong>提示：</strong></p>
             <p>• CSV格式适合Excel查看和编辑，支持中文</p>
             <p>• JSON格式适合程序读取和导入，包含完整数据结构</p>
-            <p>• 导出的文件将包含所有当前显示的术语（包括筛选后的结果）</p>
+            <p>• "当前页面"仅导出表格中显示的内容；"全部结果"将导出符合当前筛选条件的所有术语</p>
           </div>
         </Space>
       </Modal>

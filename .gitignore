@@ -32,6 +32,10 @@ console.log*
 # Debug dump files
 zz_*
 
+# Temporary fix/utility scripts
+fix-*.cjs
+
+
 # OS files
 .DS_Store
 Thumbs.db
